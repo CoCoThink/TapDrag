@@ -52,11 +52,15 @@ This allows users to choose a modifier that best fits their workflow and avoids 
 
 The menu includes an experimental **Fast Release for Double-Tap Drag** option. It is off by default.
 
-When enabled, the app reads the trackpad's raw contact states rather than inferring the gesture from mouse click counts. It recognizes a brief first one-finger tap followed, within the system double-click interval, by a longer second one-finger contact. When that second contact leaves the trackpad, it sends an immediate mouse-up rather than waiting for macOS's repositioning grace period.
+When enabled, the app reads the trackpad's raw contact states rather than inferring the gesture from mouse click counts. It recognizes a brief first one-finger tap followed, within the system double-click interval, by a second one-finger contact that actually moves. When that second contact leaves the trackpad, it sends an immediate mouse-up rather than waiting for macOS's repositioning grace period. Real movement, rather than a fixed contact-duration threshold, keeps fast drag-and-drop gestures from being missed.
+
+macOS keeps its own tap-to-drag recognizer alive for that grace period even after an application receives the synthetic mouse-up. To make a second double-tap drag possible immediately, this build takes ownership only after it has confirmed the next second contact. Its first movement is paired with a tagged mouse-down, then the drag stream and mouse-up are kept as one sequence. Native button events are filtered only while that confirmed candidate is owned, so a late stale event cannot end the owned drag. The app deliberately does not replay synthetic clicks for taps without movement, which avoids duplicate clicks and accidental file opens.
 
 This option is intended only for the **Without Drag Lock** dragging style. Do not enable it with Drag Lock, where lifting your finger is meant to keep the drag active until the next tap.
 
-It needs Accessibility permission to post the immediate mouse-up event. Input Monitoring is not required by this raw-contact implementation. The menu's `Double-Tap last` row shows whether the first tap was captured, the second contact was too short, a multi-finger touch was ignored, or an immediate mouse-up was posted. The feature remains opt-in because macOS does not provide a public API for this gesture recognition; do not rely on it while dragging with an external mouse and touching a trackpad at the same time.
+It needs permission to synthesize and monitor mouse events. On current macOS releases, Accessibility normally grants both; if macOS asks separately, also grant Input Monitoring to this exact build. The menu's `Double-Tap last` row shows whether a release was posted, a first tap was captured, or a consecutive drag is active or released. The feature remains opt-in because macOS does not provide a public API for this gesture recognition; do not rely on it while dragging with an external mouse and touching a trackpad at the same time.
+
+For implementation details, state-machine invariants, release steps, and a regression test checklist, see [the maintenance guide](docs/MAINTENANCE.md).
 
 ### Launching the enhanced build
 

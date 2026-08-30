@@ -60,24 +60,55 @@ typedef struct {
     BOOL rawTouchInvalid;
     int rawTouchingFrames;
     double rawTouchStartedTimestamp;
+    MTPoint rawTouchStartedPosition;
+    BOOL rawTouchMoved;
     BOOL rawFirstTapPending;
     double rawFirstTapStartedTimestamp;
+    BOOL rawChainCandidate;
 } DeviceState;
 
 typedef enum {
     DoubleTapDragAccessGranted,
-    DoubleTapDragAccessNeedsAccessibility,
+    DoubleTapDragAccessNeedsEventControl,
+    DoubleTapDragAccessEventTapUnavailable,
 } DoubleTapDragAccessStatus;
 
 typedef enum {
     DoubleTapReleaseOutcomeWaiting,
     DoubleTapReleaseOutcomeFirstTapCaptured,
-    DoubleTapReleaseOutcomeSecondTouchTooShort,
+    DoubleTapReleaseOutcomeSecondTouchNoDrag,
     DoubleTapReleaseOutcomeMultiFinger,
     DoubleTapReleaseOutcomeFirstTapExpired,
     DoubleTapReleaseOutcomeOverrideHeld,
     DoubleTapReleaseOutcomePosted,
+    DoubleTapReleaseOutcomeChainDragStarted,
+    DoubleTapReleaseOutcomeChainReleased,
+    DoubleTapReleaseOutcomeChainInterrupted,
 } DoubleTapReleaseOutcome;
+
+typedef enum {
+    RawTouchCompletionNone,
+    RawTouchCompletionFirstTap,
+    RawTouchCompletionSecondTouchNoDrag,
+    RawTouchCompletionSecondTouchDrag,
+    RawTouchCompletionInvalid,
+} RawTouchCompletion;
+
+typedef enum {
+    DoubleTapChainIdle,
+    DoubleTapChainAwaitingFirstTap,
+    DoubleTapChainAwaitingSecondTap,
+    DoubleTapChainSecondContact,
+    DoubleTapChainStartingDrag,
+    DoubleTapChainOwnedDrag,
+    DoubleTapChainReleasing,
+} DoubleTapChainPhase;
+
+typedef enum {
+    DoubleTapChainStartFailed,
+    DoubleTapChainStartOwned,
+    DoubleTapChainStartReleased,
+} DoubleTapChainStartResult;
 
 static atomic_bool gEnabled = true;
 static atomic_bool gShiftOverrideEnabled = true;
@@ -89,9 +120,17 @@ static atomic_llong gLastDoubleTapPostMillis = 0;
 static atomic_int gLastDoubleTapReleaseOutcome = DoubleTapReleaseOutcomeWaiting;
 static atomic_int gLastDoubleTapTouchingFrames = 0;
 static atomic_llong gLastDoubleTapTouchDurationMillis = 0;
+static atomic_int gDoubleTapChainPhase = DoubleTapChainIdle;
+static atomic_uintptr_t gDoubleTapChainDevice = 0;
+static atomic_llong gDoubleTapChainDeadlineMillis = 0;
+static atomic_bool gDoubleTapChainReleaseAfterStart = false;
+static atomic_bool gRawDoubleTapSecondContactActive = false;
+static atomic_bool gRawDoubleTapSecondContactSawDrag = false;
 static os_unfair_lock gStateLock = OS_UNFAIR_LOCK_INIT;
 static DeviceState gDeviceStates[16];
 static int gDeviceStateCount = 0;
+static CFMachPortRef gDoubleTapEventTap = NULL;
+static CFRunLoopSourceRef gDoubleTapEventTapSource = NULL;
 static NSString *const ShiftOverrideEnabledKey = @"ShiftOverrideEnabled";
 static NSString *const OverrideModifierKey = @"OverrideModifier";
 static NSString *const DoubleTapDragReleaseEnabledKey = @"DoubleTapDragReleaseEnabled";
@@ -101,8 +140,12 @@ static NSString *const OverrideModifierOption = @"Option";
 static NSString *const OverrideModifierFn = @"Fn";
 static const int64_t SyntheticThreeFingerMouseUpUserData = 0x334644334655504DLL;
 static const int64_t SyntheticDoubleTapMouseUpUserData = 0x334644445455504DLL;
+static const int64_t SyntheticDoubleTapChainMouseUserData = 0x334644434841494ELL;
 static const long long MinimumReleaseIntervalMillis = 80;
 static const double MaximumTapDurationSeconds = 0.20;
+static const float MinimumRawDragDistance = 0.0025f;
+static const long long NativeGraceSafetyMarginMillis = 250;
+static const long long MinimumNativeGraceWindowMillis = 1000;
 
 static CGEventFlags modifierMaskForName(NSString *name) {
     if ([name isEqualToString:OverrideModifierShift]) {
@@ -140,33 +183,53 @@ static BOOL claimReleaseSlot(atomic_llong *lastPostMillis) {
     }
 }
 
-static void postLeftMouseUpAtLocation(CGPoint location, int64_t userData) {
+static CGEventRef createTaggedLeftMouseEvent(CGEventType type, CGPoint location, int64_t userData, int clickState) {
     CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     if (source == NULL) {
-        return;
+        return NULL;
     }
 
-    CGEventRef event = CGEventCreateMouseEvent(source, kCGEventLeftMouseUp, location, kCGMouseButtonLeft);
+    CGEventRef event = CGEventCreateMouseEvent(source, type, location, kCGMouseButtonLeft);
     CFRelease(source);
+    if (event == NULL) {
+        return NULL;
+    }
+
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData, userData);
+    CGEventSetIntegerValueField(event, kCGMouseEventClickState, clickState);
+    return event;
+}
+
+static void postTaggedLeftMouseEvent(CGEventType type, CGPoint location, int64_t userData, int clickState) {
+    CGEventRef event = createTaggedLeftMouseEvent(type, location, userData, clickState);
     if (event == NULL) {
         return;
     }
 
-    CGEventSetIntegerValueField(event, kCGEventSourceUserData, userData);
     CGEventPost(kCGHIDEventTap, event);
     CFRelease(event);
 }
 
-static void postLeftMouseUpAtCurrentPointerWithUserData(int64_t userData) {
+static BOOL copyCurrentPointerLocation(CGPoint *location) {
     CGEventRef current = CGEventCreate(NULL);
     if (current == NULL) {
-        return;
+        return NO;
     }
 
-    CGPoint location = CGEventGetLocation(current);
+    *location = CGEventGetLocation(current);
     CFRelease(current);
+    return YES;
+}
 
-    postLeftMouseUpAtLocation(location, userData);
+static void postLeftMouseUpAtLocation(CGPoint location, int64_t userData) {
+    postTaggedLeftMouseEvent(kCGEventLeftMouseUp, location, userData, 1);
+}
+
+static void postLeftMouseUpAtCurrentPointerWithUserData(int64_t userData) {
+    CGPoint location;
+    if (copyCurrentPointerLocation(&location)) {
+        postLeftMouseUpAtLocation(location, userData);
+    }
 }
 
 static void postLeftMouseUpAtCurrentPointer(void) {
@@ -186,11 +249,70 @@ static long long systemDoubleClickIntervalMillis(void) {
     return MAX(1LL, (long long)([NSEvent doubleClickInterval] * 1000.0));
 }
 
+static long long nativeGraceWindowMillis(void) {
+    return MAX(MinimumNativeGraceWindowMillis,
+               systemDoubleClickIntervalMillis() + NativeGraceSafetyMarginMillis);
+}
+
+static void resetDoubleTapChainState(void) {
+    atomic_store(&gDoubleTapChainPhase, DoubleTapChainIdle);
+    atomic_store(&gDoubleTapChainDevice, 0);
+    atomic_store(&gDoubleTapChainDeadlineMillis, 0);
+    atomic_store(&gDoubleTapChainReleaseAfterStart, false);
+}
+
+static void armDoubleTapChainForDevice(MTDeviceRef device) {
+    atomic_store(&gDoubleTapChainDevice, (uintptr_t)device);
+    atomic_store(&gDoubleTapChainReleaseAfterStart, false);
+    atomic_store(&gDoubleTapChainDeadlineMillis, nowMillis() + nativeGraceWindowMillis());
+    atomic_store(&gDoubleTapChainPhase, DoubleTapChainAwaitingFirstTap);
+}
+
+static BOOL doubleTapChainAwaitsFirstTapForDevice(MTDeviceRef device) {
+    if (atomic_load(&gDoubleTapChainPhase) != DoubleTapChainAwaitingFirstTap ||
+        atomic_load(&gDoubleTapChainDevice) != (uintptr_t)device) {
+        return NO;
+    }
+    if (nowMillis() <= atomic_load(&gDoubleTapChainDeadlineMillis)) {
+        return YES;
+    }
+    resetDoubleTapChainState();
+    return NO;
+}
+
+static BOOL doubleTapChainAwaitsSecondTapForDevice(MTDeviceRef device) {
+    if (atomic_load(&gDoubleTapChainPhase) != DoubleTapChainAwaitingSecondTap ||
+        atomic_load(&gDoubleTapChainDevice) != (uintptr_t)device) {
+        return NO;
+    }
+    if (nowMillis() <= atomic_load(&gDoubleTapChainDeadlineMillis)) {
+        return YES;
+    }
+    resetDoubleTapChainState();
+    return NO;
+}
+
+static BOOL isTaggedDoubleTapEvent(CGEventRef event) {
+    int64_t userData = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
+    return userData == SyntheticDoubleTapMouseUpUserData ||
+           userData == SyntheticDoubleTapChainMouseUserData;
+}
+
+static BOOL beginOwnedDoubleTapChainRelease(void) {
+    int expectedPhase = DoubleTapChainOwnedDrag;
+    return atomic_compare_exchange_strong(&gDoubleTapChainPhase,
+                                          &expectedPhase,
+                                          DoubleTapChainReleasing);
+}
+
 static void resetRawCurrentTouchLocked(DeviceState *state) {
     state->rawTouchMade = NO;
     state->rawTouchInvalid = NO;
     state->rawTouchingFrames = 0;
     state->rawTouchStartedTimestamp = 0;
+    state->rawTouchStartedPosition = (MTPoint){0, 0};
+    state->rawTouchMoved = NO;
+    state->rawChainCandidate = NO;
 }
 
 static void resetRawDoubleTapStateLocked(DeviceState *state) {
@@ -201,6 +323,15 @@ static void resetRawDoubleTapStateLocked(DeviceState *state) {
 
 static BOOL isActualTouchState(uint32_t touchState) {
     return touchState == MTTouchStateMakeTouch || touchState == MTTouchStateTouching;
+}
+
+static BOOL isRawSecondTapWindowLocked(const DeviceState *state, double timestamp) {
+    if (!state->rawTouchMade || !state->rawFirstTapPending ||
+        timestamp < state->rawFirstTapStartedTimestamp) {
+        return NO;
+    }
+    return timestamp - state->rawFirstTapStartedTimestamp <=
+        (double)systemDoubleClickIntervalMillis() / 1000.0;
 }
 
 // Tap-to-drag is two real one-finger contact cycles. The first is brief; the
@@ -231,28 +362,63 @@ static void observeRawTouchFrameLocked(DeviceState *state, const void *contacts,
         return;
     }
 
-    if (primaryTouch->state == MTTouchStateMakeTouch ||
-        (!state->rawTouchMade && primaryTouch->state == MTTouchStateTouching)) {
+    if (!state->rawTouchMade &&
+        (primaryTouch->state == MTTouchStateMakeTouch || primaryTouch->state == MTTouchStateTouching)) {
         state->rawTouchMade = YES;
         state->rawTouchStartedTimestamp = timestamp;
+        state->rawTouchStartedPosition = primaryTouch->normalizedVector.position;
+        state->rawTouchMoved = NO;
     }
     if (state->rawTouchMade && primaryTouch->state == MTTouchStateTouching) {
         state->rawTouchingFrames++;
+        float deltaX = primaryTouch->normalizedVector.position.x - state->rawTouchStartedPosition.x;
+        float deltaY = primaryTouch->normalizedVector.position.y - state->rawTouchStartedPosition.y;
+        if (deltaX * deltaX + deltaY * deltaY >= MinimumRawDragDistance * MinimumRawDragDistance) {
+            state->rawTouchMoved = YES;
+        }
     }
 }
 
-static BOOL completeRawDoubleTapLocked(DeviceState *state, double completedTimestamp) {
+static BOOL startRawDoubleTapChainCandidateLocked(MTDeviceRef device, DeviceState *state, double timestamp) {
+    if (state->rawChainCandidate || state->rawTouchInvalid || !state->rawTouchMade ||
+        !state->rawFirstTapPending || !doubleTapChainAwaitsSecondTapForDevice(device)) {
+        return NO;
+    }
+
+    double interval = (double)systemDoubleClickIntervalMillis() / 1000.0;
+    if (timestamp < state->rawFirstTapStartedTimestamp ||
+        timestamp - state->rawFirstTapStartedTimestamp > interval) {
+        resetDoubleTapChainState();
+        return NO;
+    }
+
+    if (isOverrideModifierHeld()) {
+        resetDoubleTapChainState();
+        return NO;
+    }
+
+    int expectedPhase = DoubleTapChainAwaitingSecondTap;
+    if (!atomic_compare_exchange_strong(&gDoubleTapChainPhase, &expectedPhase, DoubleTapChainSecondContact)) {
+        return NO;
+    }
+    state->rawChainCandidate = YES;
+    return YES;
+}
+
+static RawTouchCompletion completeRawDoubleTapLocked(DeviceState *state,
+                                                     double completedTimestamp,
+                                                     BOOL sawNativeDrag) {
     int touchingFrames = state->rawTouchingFrames;
     atomic_store(&gLastDoubleTapTouchingFrames, touchingFrames);
 
     if (state->rawTouchInvalid) {
         atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeMultiFinger);
         resetRawDoubleTapStateLocked(state);
-        return NO;
+        return RawTouchCompletionInvalid;
     }
     if (!state->rawTouchMade) {
         resetRawCurrentTouchLocked(state);
-        return NO;
+        return RawTouchCompletionNone;
     }
 
     double touchStartedTimestamp = state->rawTouchStartedTimestamp;
@@ -262,13 +428,15 @@ static BOOL completeRawDoubleTapLocked(DeviceState *state, double completedTimes
         touchStartedTimestamp >= state->rawFirstTapStartedTimestamp &&
         touchStartedTimestamp - state->rawFirstTapStartedTimestamp <= (double)systemDoubleClickIntervalMillis() / 1000.0;
     BOOL isShortTap = touchDurationMillis <= (long long)(MaximumTapDurationSeconds * 1000.0);
-    BOOL isLongSecondTouch = !isShortTap;
 
-    if (previousTapIsRecent && isLongSecondTouch) {
+    if (previousTapIsRecent) {
         state->rawFirstTapPending = NO;
         state->rawFirstTapStartedTimestamp = 0;
+        BOOL isDrag = state->rawTouchMoved || sawNativeDrag;
+        atomic_store(&gLastDoubleTapReleaseOutcome,
+                     isDrag ? DoubleTapReleaseOutcomeWaiting : DoubleTapReleaseOutcomeSecondTouchNoDrag);
         resetRawCurrentTouchLocked(state);
-        return YES;
+        return isDrag ? RawTouchCompletionSecondTouchDrag : RawTouchCompletionSecondTouchNoDrag;
     }
 
     if (state->rawFirstTapPending && !previousTapIsRecent) {
@@ -278,15 +446,16 @@ static BOOL completeRawDoubleTapLocked(DeviceState *state, double completedTimes
     if (isShortTap) {
         state->rawFirstTapPending = YES;
         state->rawFirstTapStartedTimestamp = touchStartedTimestamp;
-        atomic_store(&gLastDoubleTapReleaseOutcome,
-                     previousTapIsRecent ? DoubleTapReleaseOutcomeSecondTouchTooShort : DoubleTapReleaseOutcomeFirstTapCaptured);
+        atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeFirstTapCaptured);
+        resetRawCurrentTouchLocked(state);
+        return RawTouchCompletionFirstTap;
     } else {
         state->rawFirstTapPending = NO;
         state->rawFirstTapStartedTimestamp = 0;
     }
 
     resetRawCurrentTouchLocked(state);
-    return NO;
+    return RawTouchCompletionNone;
 }
 
 static void resetDeviceTouchStatesLocked(void) {
@@ -295,6 +464,8 @@ static void resetDeviceTouchStatesLocked(void) {
         gDeviceStates[i].contactCount = 0;
         resetRawDoubleTapStateLocked(&gDeviceStates[i]);
     }
+    atomic_store(&gRawDoubleTapSecondContactActive, false);
+    atomic_store(&gRawDoubleTapSecondContactSawDrag, false);
 }
 
 static BOOL isDoubleTapDragReleaseEnabledForEpoch(unsigned long long epoch) {
@@ -303,12 +474,127 @@ static BOOL isDoubleTapDragReleaseEnabledForEpoch(unsigned long long epoch) {
            atomic_load(&gDoubleTapDragReleaseEpoch) == epoch;
 }
 
+static DoubleTapChainStartResult startDoubleTapChainDragBeforeEvent(CGEventTapProxy proxy, CGEventRef event) {
+    int expectedPhase = DoubleTapChainSecondContact;
+    if (!atomic_compare_exchange_strong(&gDoubleTapChainPhase, &expectedPhase, DoubleTapChainStartingDrag)) {
+        return DoubleTapChainStartFailed;
+    }
+
+    CGEventRef down = createTaggedLeftMouseEvent(kCGEventLeftMouseDown,
+                                                  CGEventGetLocation(event),
+                                                  SyntheticDoubleTapChainMouseUserData,
+                                                  1);
+    if (down == NULL) {
+        atomic_store(&gDoubleTapChainPhase, DoubleTapChainSecondContact);
+        return DoubleTapChainStartFailed;
+    }
+    CGEventTapPostEvent(proxy, down);
+    CFRelease(down);
+
+    atomic_store(&gDoubleTapChainPhase, DoubleTapChainOwnedDrag);
+    atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeChainDragStarted);
+
+    if (atomic_exchange(&gDoubleTapChainReleaseAfterStart, false)) {
+        atomic_store(&gDoubleTapChainPhase, DoubleTapChainReleasing);
+        postLeftMouseUpAtCurrentPointerWithUserData(SyntheticDoubleTapChainMouseUserData);
+        armDoubleTapChainForDevice((MTDeviceRef)atomic_load(&gDoubleTapChainDevice));
+        atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeChainReleased);
+        return DoubleTapChainStartReleased;
+    }
+    return DoubleTapChainStartOwned;
+}
+
+static CGEventRef doubleTapEventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
+    (void)refcon;
+
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        int phase = atomic_load(&gDoubleTapChainPhase);
+        if (phase == DoubleTapChainOwnedDrag || phase == DoubleTapChainStartingDrag ||
+            phase == DoubleTapChainReleasing) {
+            postLeftMouseUpAtCurrentPointerWithUserData(SyntheticDoubleTapChainMouseUserData);
+        }
+        resetDoubleTapChainState();
+        atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeChainInterrupted);
+        if (gDoubleTapEventTap != NULL) {
+            CGEventTapEnable(gDoubleTapEventTap, true);
+        }
+        return event;
+    }
+
+    if (event == NULL || !atomic_load(&gEnabled) || !atomic_load(&gDoubleTapDragReleaseEnabled) ||
+        isTaggedDoubleTapEvent(event)) {
+        return event;
+    }
+
+    if (type == kCGEventLeftMouseDragged && atomic_load(&gRawDoubleTapSecondContactActive)) {
+        atomic_store(&gRawDoubleTapSecondContactSawDrag, true);
+    }
+
+    long long now = nowMillis();
+    int phase = atomic_load(&gDoubleTapChainPhase);
+    if ((phase == DoubleTapChainAwaitingFirstTap || phase == DoubleTapChainAwaitingSecondTap) &&
+        now > atomic_load(&gDoubleTapChainDeadlineMillis)) {
+        resetDoubleTapChainState();
+        phase = DoubleTapChainIdle;
+    }
+
+    if (phase == DoubleTapChainReleasing) {
+        return NULL;
+    }
+
+    if (phase != DoubleTapChainSecondContact && phase != DoubleTapChainStartingDrag && phase != DoubleTapChainOwnedDrag) {
+        return event;
+    }
+
+    if (type == kCGEventLeftMouseDown || type == kCGEventLeftMouseUp) {
+        return NULL;
+    }
+
+    if (phase == DoubleTapChainStartingDrag) {
+        return NULL;
+    }
+
+    if (type != kCGEventMouseMoved && type != kCGEventLeftMouseDragged) {
+        return event;
+    }
+
+    if (phase == DoubleTapChainSecondContact) {
+        DoubleTapChainStartResult startResult = startDoubleTapChainDragBeforeEvent(proxy, event);
+        if (startResult != DoubleTapChainStartOwned) {
+            return NULL;
+        }
+        phase = atomic_load(&gDoubleTapChainPhase);
+    }
+
+    if (phase != DoubleTapChainOwnedDrag) {
+        return NULL;
+    }
+
+    CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, kCGMouseButtonLeft);
+    CGEventSetIntegerValueField(event, kCGMouseEventClickState, 1);
+    CGEventSetType(event, kCGEventLeftMouseDragged);
+    return event;
+}
+
+static void stopDoubleTapChainAndReleaseIfNeeded(void) {
+    int phase = atomic_load(&gDoubleTapChainPhase);
+    resetDoubleTapChainState();
+    if (phase == DoubleTapChainOwnedDrag || phase == DoubleTapChainStartingDrag ||
+        phase == DoubleTapChainReleasing) {
+        postLeftMouseUpAtCurrentPointerWithUserData(SyntheticDoubleTapChainMouseUserData);
+    }
+}
+
 static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactCount, double timestamp, int frame) {
     (void)frame;
 
     BOOL shouldPostThreeFinger = NO;
     BOOL shouldPostDoubleTap = NO;
+    BOOL shouldPostChainUp = NO;
+    BOOL shouldRearmChainAfterUp = NO;
+    BOOL shouldPostInterruptedChainUp = NO;
     unsigned long long doubleTapEnableEpoch = 0;
+    unsigned long long chainEnableEpoch = 0;
 
     os_unfair_lock_lock(&gStateLock);
     DeviceState *state = deviceStateForDeviceLocked(device);
@@ -319,10 +605,20 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
     }
 
     if (!atomic_load(&gEnabled)) {
+        int chainPhase = atomic_load(&gDoubleTapChainPhase);
+        shouldPostInterruptedChainUp = chainPhase == DoubleTapChainOwnedDrag ||
+            chainPhase == DoubleTapChainStartingDrag ||
+            chainPhase == DoubleTapChainReleasing;
+        resetDoubleTapChainState();
         state->maxContacts = 0;
         state->contactCount = 0;
         resetRawDoubleTapStateLocked(state);
+        atomic_store(&gRawDoubleTapSecondContactActive, false);
+        atomic_store(&gRawDoubleTapSecondContactSawDrag, false);
         os_unfair_lock_unlock(&gStateLock);
+        if (shouldPostInterruptedChainUp) {
+            postLeftMouseUpAtCurrentPointerWithUserData(SyntheticDoubleTapChainMouseUserData);
+        }
         return 0;
     }
 
@@ -330,15 +626,37 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
         if (state->contactCount == 0) {
             state->maxContacts = 0;
             resetRawCurrentTouchLocked(state);
+            atomic_store(&gRawDoubleTapSecondContactActive, false);
+            atomic_store(&gRawDoubleTapSecondContactSawDrag, false);
         }
         state->contactCount = contactCount;
         state->maxContacts = MAX(state->maxContacts, contactCount);
         if (atomic_load(&gDoubleTapDragReleaseEnabled)) {
             observeRawTouchFrameLocked(state, contacts, contactCount, timestamp);
+            if (isRawSecondTapWindowLocked(state, timestamp)) {
+                atomic_store(&gRawDoubleTapSecondContactActive, true);
+            }
+            startRawDoubleTapChainCandidateLocked(device, state, timestamp);
+            if (state->rawTouchInvalid && state->rawChainCandidate) {
+                int chainPhase = atomic_load(&gDoubleTapChainPhase);
+                if (chainPhase == DoubleTapChainOwnedDrag) {
+                    shouldPostInterruptedChainUp = beginOwnedDoubleTapChainRelease();
+                } else if (chainPhase == DoubleTapChainStartingDrag) {
+                    atomic_store(&gDoubleTapChainReleaseAfterStart, true);
+                } else {
+                    resetDoubleTapChainState();
+                }
+                state->rawChainCandidate = NO;
+                atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeChainInterrupted);
+            }
         } else {
             resetRawDoubleTapStateLocked(state);
         }
         os_unfair_lock_unlock(&gStateLock);
+        if (shouldPostInterruptedChainUp) {
+            postLeftMouseUpAtCurrentPointerWithUserData(SyntheticDoubleTapChainMouseUserData);
+            resetDoubleTapChainState();
+        }
         return 0;
     }
 
@@ -349,12 +667,57 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
 
     int completedMaxContacts = state->maxContacts;
     shouldPostThreeFinger = completedMaxContacts == 3;
-    if (atomic_load(&gDoubleTapDragReleaseEnabled) && completeRawDoubleTapLocked(state, timestamp)) {
-        if (isOverrideModifierHeld()) {
-            atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeOverrideHeld);
-        } else if (claimReleaseSlot(&gLastDoubleTapPostMillis)) {
-            shouldPostDoubleTap = YES;
-            doubleTapEnableEpoch = atomic_load(&gDoubleTapDragReleaseEpoch);
+    if (atomic_load(&gDoubleTapDragReleaseEnabled)) {
+        BOOL wasChainCandidate = state->rawChainCandidate;
+        BOOL sawNativeDrag = atomic_exchange(&gRawDoubleTapSecondContactSawDrag, false);
+        atomic_store(&gRawDoubleTapSecondContactActive, false);
+        RawTouchCompletion completion = completeRawDoubleTapLocked(state, timestamp, sawNativeDrag);
+
+        if (wasChainCandidate) {
+            int chainPhase = atomic_load(&gDoubleTapChainPhase);
+            if (completion == RawTouchCompletionInvalid) {
+                if (chainPhase == DoubleTapChainOwnedDrag) {
+                    if (beginOwnedDoubleTapChainRelease()) {
+                        shouldPostChainUp = YES;
+                        chainEnableEpoch = atomic_load(&gDoubleTapDragReleaseEpoch);
+                    }
+                } else if (chainPhase == DoubleTapChainStartingDrag) {
+                    atomic_store(&gDoubleTapChainReleaseAfterStart, true);
+                } else {
+                    resetDoubleTapChainState();
+                }
+                atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeChainInterrupted);
+            } else if (chainPhase == DoubleTapChainOwnedDrag) {
+                if (beginOwnedDoubleTapChainRelease()) {
+                    shouldPostChainUp = YES;
+                    shouldRearmChainAfterUp = YES;
+                    chainEnableEpoch = atomic_load(&gDoubleTapDragReleaseEpoch);
+                }
+            } else if (chainPhase == DoubleTapChainStartingDrag) {
+                atomic_store(&gDoubleTapChainReleaseAfterStart, true);
+            } else if (chainPhase == DoubleTapChainSecondContact) {
+                state->rawFirstTapPending = NO;
+                state->rawFirstTapStartedTimestamp = 0;
+                resetDoubleTapChainState();
+            } else {
+                resetDoubleTapChainState();
+            }
+        } else if (completion == RawTouchCompletionFirstTap &&
+                   doubleTapChainAwaitsFirstTapForDevice(device)) {
+            int expectedPhase = DoubleTapChainAwaitingFirstTap;
+            if (atomic_compare_exchange_strong(&gDoubleTapChainPhase,
+                                               &expectedPhase,
+                                               DoubleTapChainAwaitingSecondTap)) {
+                atomic_store(&gDoubleTapChainDeadlineMillis,
+                             nowMillis() + systemDoubleClickIntervalMillis());
+            }
+        } else if (completion == RawTouchCompletionSecondTouchDrag) {
+            if (isOverrideModifierHeld()) {
+                atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeOverrideHeld);
+            } else if (claimReleaseSlot(&gLastDoubleTapPostMillis)) {
+                shouldPostDoubleTap = YES;
+                doubleTapEnableEpoch = atomic_load(&gDoubleTapDragReleaseEpoch);
+            }
         }
     }
     state->maxContacts = 0;
@@ -366,8 +729,19 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
         postLeftMouseUpAtCurrentPointer();
     }
 
+    if (shouldPostChainUp) {
+        postLeftMouseUpAtCurrentPointerWithUserData(SyntheticDoubleTapChainMouseUserData);
+        if (shouldRearmChainAfterUp && isDoubleTapDragReleaseEnabledForEpoch(chainEnableEpoch)) {
+            armDoubleTapChainForDevice(device);
+        } else {
+            resetDoubleTapChainState();
+        }
+        atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomeChainReleased);
+    }
+
     if (shouldPostDoubleTap && isDoubleTapDragReleaseEnabledForEpoch(doubleTapEnableEpoch)) {
         postLeftMouseUpAtCurrentPointerWithUserData(SyntheticDoubleTapMouseUpUserData);
+        armDoubleTapChainForDevice(device);
         atomic_store(&gLastDoubleTapReleaseOutcome, DoubleTapReleaseOutcomePosted);
     }
     return 0;
@@ -405,7 +779,8 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
     atomic_store(&gOverrideModifierMask, modifierMaskForName([defaults stringForKey:OverrideModifierKey]));
     atomic_store(&gDoubleTapDragReleaseEnabled, NO);
     if ([defaults boolForKey:DoubleTapDragReleaseEnabledKey] &&
-        [self doubleTapDragAccessStatusRequestingIfNeeded:NO] == DoubleTapDragAccessGranted) {
+        [self doubleTapDragAccessStatusRequestingIfNeeded:NO] == DoubleTapDragAccessGranted &&
+        [self installDoubleTapEventTap]) {
         atomic_fetch_add(&gDoubleTapDragReleaseEpoch, 1);
         atomic_store(&gDoubleTapDragReleaseEnabled, YES);
     }
@@ -424,11 +799,18 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
+    int chainPhase = atomic_load(&gDoubleTapChainPhase);
     atomic_store(&gDoubleTapDragReleaseEnabled, NO);
     atomic_fetch_add(&gDoubleTapDragReleaseEpoch, 1);
+    resetDoubleTapChainState();
     os_unfair_lock_lock(&gStateLock);
     resetDeviceTouchStatesLocked();
     os_unfair_lock_unlock(&gStateLock);
+    if (chainPhase == DoubleTapChainOwnedDrag || chainPhase == DoubleTapChainStartingDrag ||
+        chainPhase == DoubleTapChainReleasing) {
+        postLeftMouseUpAtCurrentPointerWithUserData(SyntheticDoubleTapChainMouseUserData);
+    }
+    [self removeDoubleTapEventTap];
     // MultitouchSupport owns callbacks without a stable public unregister API.
     // Let process teardown reclaim these private-framework resources.
     self.deviceList = NULL;
@@ -544,6 +926,7 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
     atomic_store(&gEnabled, enabled);
     if (!enabled) {
         atomic_fetch_add(&gDoubleTapDragReleaseEpoch, 1);
+        stopDoubleTapChainAndReleaseIfNeeded();
         os_unfair_lock_lock(&gStateLock);
         resetDeviceTouchStatesLocked();
         os_unfair_lock_unlock(&gStateLock);
@@ -567,6 +950,9 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
     BOOL shouldEnable = !atomic_load(&gDoubleTapDragReleaseEnabled);
     if (shouldEnable) {
         DoubleTapDragAccessStatus accessStatus = [self doubleTapDragAccessStatusRequestingIfNeeded:YES];
+        if (accessStatus == DoubleTapDragAccessGranted && ![self installDoubleTapEventTap]) {
+            accessStatus = DoubleTapDragAccessEventTapUnavailable;
+        }
         if (accessStatus != DoubleTapDragAccessGranted) {
             atomic_store(&gDoubleTapDragReleaseEnabled, NO);
             [self updateDoubleTapDragReleaseMenuState];
@@ -579,6 +965,7 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
     } else {
         atomic_store(&gDoubleTapDragReleaseEnabled, NO);
         atomic_fetch_add(&gDoubleTapDragReleaseEpoch, 1);
+        stopDoubleTapChainAndReleaseIfNeeded();
         os_unfair_lock_lock(&gStateLock);
         resetDeviceTouchStatesLocked();
         os_unfair_lock_unlock(&gStateLock);
@@ -641,21 +1028,77 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
     return trusted;
 }
 
+- (BOOL)installDoubleTapEventTap {
+    if (gDoubleTapEventTap != NULL) {
+        if (!CGEventTapIsEnabled(gDoubleTapEventTap)) {
+            CGEventTapEnable(gDoubleTapEventTap, true);
+        }
+        return YES;
+    }
+
+    CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved) |
+        CGEventMaskBit(kCGEventLeftMouseDown) |
+        CGEventMaskBit(kCGEventLeftMouseDragged) |
+        CGEventMaskBit(kCGEventLeftMouseUp);
+    CFMachPortRef tap = CGEventTapCreate(kCGSessionEventTap,
+                                         kCGHeadInsertEventTap,
+                                         kCGEventTapOptionDefault,
+                                         mask,
+                                         doubleTapEventTapCallback,
+                                         NULL);
+    if (tap == NULL) {
+        return NO;
+    }
+
+    CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+    if (source == NULL) {
+        CFRelease(tap);
+        return NO;
+    }
+
+    gDoubleTapEventTap = tap;
+    gDoubleTapEventTapSource = source;
+    CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    return YES;
+}
+
+- (void)removeDoubleTapEventTap {
+    CFMachPortRef tap = gDoubleTapEventTap;
+    CFRunLoopSourceRef source = gDoubleTapEventTapSource;
+    gDoubleTapEventTap = NULL;
+    gDoubleTapEventTapSource = NULL;
+    if (source != NULL) {
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+        CFRelease(source);
+    }
+    if (tap != NULL) {
+        CFMachPortInvalidate(tap);
+        CFRelease(tap);
+    }
+}
+
 - (DoubleTapDragAccessStatus)doubleTapDragAccessStatusRequestingIfNeeded:(BOOL)prompt {
     BOOL canPost = CGPreflightPostEventAccess();
+    BOOL canListen = CGPreflightListenEventAccess();
     if (prompt && !canPost) {
         CGRequestPostEventAccess();
     }
+    if (prompt && !canListen) {
+        CGRequestListenEventAccess();
+    }
     canPost = CGPreflightPostEventAccess();
-    return canPost ? DoubleTapDragAccessGranted : DoubleTapDragAccessNeedsAccessibility;
+    canListen = CGPreflightListenEventAccess();
+    return canPost && canListen ? DoubleTapDragAccessGranted : DoubleTapDragAccessNeedsEventControl;
 }
 
 - (NSString *)doubleTapDragAccessStatusTitle:(DoubleTapDragAccessStatus)status {
     switch (status) {
         case DoubleTapDragAccessGranted:
-            return @"Double-Tap Drag: Event Posting Permission Granted";
-        case DoubleTapDragAccessNeedsAccessibility:
-            return @"Double-Tap Drag: Accessibility / Event Posting Required";
+            return @"Double-Tap Drag: Event Control Permission Granted";
+        case DoubleTapDragAccessNeedsEventControl:
+            return @"Double-Tap Drag: Accessibility / Input Monitoring Required";
+        case DoubleTapDragAccessEventTapUnavailable:
+            return @"Double-Tap Drag: Event Filter Unavailable";
     }
     return @"Double-Tap Drag: Permission Status Unknown";
 }
@@ -675,10 +1118,14 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
 }
 
 - (void)presentDoubleTapDragAccessAlertForStatus:(DoubleTapDragAccessStatus)status {
-    (void)status;
     NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"Double-Tap Drag Fast Release Was Not Enabled";
-    alert.informativeText = @"This build needs Accessibility permission to post the immediate mouse-up event. Grant permission to this exact app, then quit and reopen it. Rebuilding an ad-hoc-signed app can require granting permission again.";
+    if (status == DoubleTapDragAccessEventTapUnavailable) {
+        alert.messageText = @"Double-Tap Drag Event Filter Was Not Enabled";
+        alert.informativeText = @"macOS allowed event access but did not create the session event filter required for consecutive double-tap drags. Quit and reopen this exact build, then verify Accessibility and Input Monitoring access before trying again.";
+    } else {
+        alert.messageText = @"Double-Tap Drag Fast Release Was Not Enabled";
+        alert.informativeText = @"This build needs permission to synthesize and monitor mouse events for the consecutive-drag workaround. Grant Accessibility access to this exact app; if macOS separately requests Input Monitoring, grant that as well. Rebuilding an ad-hoc-signed app can require granting permission again.";
+    }
     [alert addButtonWithTitle:@"Open Accessibility Settings"];
     [alert addButtonWithTitle:@"Cancel"];
 
@@ -695,8 +1142,8 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
     switch (outcome) {
         case DoubleTapReleaseOutcomeFirstTapCaptured:
             return @"Double-Tap last: first tap captured";
-        case DoubleTapReleaseOutcomeSecondTouchTooShort:
-            return [NSString stringWithFormat:@"Double-Tap last: second touch too short (%lld ms, %d frames)", durationMillis, touchingFrames];
+        case DoubleTapReleaseOutcomeSecondTouchNoDrag:
+            return [NSString stringWithFormat:@"Double-Tap last: second touch ended without drag (%lld ms, %d frames)", durationMillis, touchingFrames];
         case DoubleTapReleaseOutcomeMultiFinger:
             return @"Double-Tap last: ignored multi-finger touch";
         case DoubleTapReleaseOutcomeFirstTapExpired:
@@ -704,7 +1151,13 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
         case DoubleTapReleaseOutcomeOverrideHeld:
             return @"Double-Tap last: native release kept (override held)";
         case DoubleTapReleaseOutcomePosted:
-            return [NSString stringWithFormat:@"Double-Tap last: immediate mouse-up posted (%lld ms, %d frames)", durationMillis, touchingFrames];
+            return [NSString stringWithFormat:@"Double-Tap last: immediate release posted; next drag armed (%lld ms, %d frames)", durationMillis, touchingFrames];
+        case DoubleTapReleaseOutcomeChainDragStarted:
+            return @"Double-Tap last: consecutive drag active";
+        case DoubleTapReleaseOutcomeChainReleased:
+            return @"Double-Tap last: consecutive drag released";
+        case DoubleTapReleaseOutcomeChainInterrupted:
+            return @"Double-Tap last: consecutive drag returned to native input";
         case DoubleTapReleaseOutcomeWaiting:
             return @"Double-Tap last: waiting for first tap";
     }
