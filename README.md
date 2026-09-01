@@ -48,17 +48,22 @@ This allows users to choose a modifier that best fits their workflow and avoids 
 
 **Note on Fn (Globe):** Fn (Globe) works best on Apple built-in keyboards and Apple Magic Keyboards. Support on third-party keyboards depends on whether the keyboard exposes the Fn key to macOS; some keyboards handle Fn internally and never report it to the system, so the override cannot trigger.
 
-### Double-Tap Drag Fast Release
+### Double-Tap Drag Replacement
 
-The menu includes an experimental **Fast Release for Double-Tap Drag** option. It is off by default.
+macOS intentionally keeps **Without Drag Lock** alive briefly after the finger lifts so the finger can be repositioned. It exposes dragging on/off and dragging style settings, but no separate preference for shortening that release grace. Changing the global double-click interval also changes whether a double tap is recognized, so it is not an independent release-delay control.
 
-When enabled, the app reads the trackpad's raw contact states rather than inferring the gesture from mouse click counts. It recognizes a brief first one-finger tap followed, within the system double-click interval, by a second one-finger contact that actually moves. When that second contact leaves the trackpad, it sends an immediate mouse-up rather than waiting for macOS's repositioning grace period. Real movement, rather than a fixed contact-duration threshold, keeps fast drag-and-drop gestures from being missed.
+The recommended mode therefore removes the native recognizer from this gesture and lets the app own the drag:
 
-macOS keeps its own tap-to-drag recognizer alive for that grace period even after an application receives the synthetic mouse-up. To make a second double-tap drag possible immediately, this build takes ownership only after it has confirmed the next second contact. Its first movement is paired with a tagged mouse-down, then the drag stream and mouse-up are kept as one sequence. Native button events are filtered only while that confirmed candidate is owned, so a late stale event cannot end the owned drag. The app deliberately does not replay synthetic clicks for taps without movement, which avoids duplicate clicks and accidental file opens.
+1. In **System Settings -> Accessibility -> Pointer Control -> Trackpad Options**, turn off **Use trackpad for dragging**.
+2. Keep ordinary **Tap to click** enabled in Trackpad settings.
+3. Enable **Double-Tap Drag Replacement (Experimental)** in the `3F+` menu.
+4. Confirm that the status row says **Double-Tap Drag: Full replacement ready**.
 
-This option is intended only for the **Without Drag Lock** dragging style. Do not enable it with Drag Lock, where lifting your finger is meant to keep the drag active until the next tap.
+The first tap remains a normal macOS tap-to-click, preserving Finder selection and background-window activation. The app detects the second raw one-finger contact, waits for real movement, then publishes one complete tagged `down -> dragged -> up` transaction. Raw finger lift owns the up and returns the state machine directly to `Idle`; there is no native tap-to-drag grace or shadow session to clean up. A 40ms start allowance lets the normal first click reach Finder/AppKit before the synthetic drag down, but it does not delay release.
 
-It needs permission to synthesize and monitor mouse events. On current macOS releases, Accessibility normally grants both; if macOS asks separately, also grant Input Monitoring to this exact build. The menu's `Double-Tap last` row shows whether a release was posted, a first tap was captured, or a consecutive drag is active or released. The feature remains opt-in because macOS does not provide a public API for this gesture recognition; do not rely on it while dragging with an external mouse and touching a trackpad at the same time.
+If native trackpad dragging remains enabled, the replacement stays inactive and does not filter or synthesize double-tap drag events. There is no legacy compatibility or shadow path.
+
+This feature needs permission to synthesize and monitor mouse events. Accessibility normally grants both; if macOS asks separately, also grant Input Monitoring to this exact build. Diagnostics are written to `~/Library/Logs/3FDragUnstuck/DoubleTap/` while the feature is enabled. The feature remains opt-in because raw contact capture uses Apple's private `MultitouchSupport.framework`. Do not combine the experimental gesture with simultaneous external-mouse button input. If the app is not running, double-tap dragging is unavailable until either the app is restarted or native trackpad dragging is turned back on.
 
 For implementation details, state-machine invariants, release steps, and a regression test checklist, see [the maintenance guide](docs/MAINTENANCE.md).
 
@@ -84,15 +89,32 @@ make build
 
 ### Local-build permissions
 
-The default build uses an ad-hoc signature. macOS ties Accessibility grants to the app's code signature, so rebuilding after source changes can invalidate an earlier grant. After rebuilding, quit the old process and grant permission again to the current `build/3FDragUnstuck.app` if the menu reports that permission is required. This fork has its own bundle identifier, so it can coexist with the original app without confusing LaunchServices or permission records.
+Run this once before the first local build:
 
-For a stable local developer identity, pass a signing identity when building:
+```bash
+make setup-local-signing
+```
+
+It creates a local-only self-signed Code Signing identity named `3FDragUnstuck Local Development` in the login keychain. Normal `make build` then uses that same identity every time. macOS ties Accessibility and Input Monitoring grants to the app's designated requirement; unlike an ad-hoc signature, this requirement remains stable after source changes.
+
+After migrating from an older ad-hoc build, grant permission once more to the newly signed `build/3FDragUnstuck.app`. Subsequent rebuilds do not require reauthorization as long as the bundle identifier and the local signing certificate/private key remain unchanged. Check the active identity and designated requirement with:
+
+```bash
+make signing-status
+```
+
+If a certificate with the same local identity name remains but its private key
+is missing, `make setup-local-signing` stops instead of silently replacing it.
+Restore that key, or deliberately remove the certificate and grant permission
+once again after creating a new identity.
+
+For an Apple-issued local identity, override the default explicitly:
 
 ```bash
 THREE_F_DRAG_CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" make build
 ```
 
-Use `security find-identity -v -p codesigning` to list identities available on the machine.
+`make build-adhoc` is retained only for a temporary build that does not need persistent privacy permissions. The local self-signed identity is not a release identity: `make release` deliberately does not inherit it. Use a Developer ID identity and notarization before distributing outside this Mac.
 
 ## Verification
 
@@ -103,7 +125,7 @@ make verify
 ## Requirements
 
 * macOS
-* Accessibility permission enabled for the exact application build
+* Accessibility permission enabled once for the stable local application identity
 
 ## License
 
