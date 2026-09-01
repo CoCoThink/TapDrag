@@ -62,7 +62,7 @@ macOS 没有公开的独立参数用于缩短 Without Drag Lock 的抬手等待�
 3. 第二触必须在 `min(system double-click interval, 600ms)` 内开始。上限来自本机实测：`528–552ms` 的真实双击拖动必须接受，而之前出现误判的 `640ms` 和 `721ms` 必须拒绝。
 4. 第二触进入 `dragging-or-doubletap` 歧义状态。移动超过 `1.3mm` 时立即确认拖动；未越过阈值但持续触摸 `180ms` 时也确认拖动；在此之前抬手仍是普通双击，不合成 down/up。
 5. `BreakTouch` 的最终位置必须参与位移判断，覆盖只在最后一帧移动的快速拖放。
-6. 旧 identity 的 `BreakTouch` 与新 identity 的 `MakeTouch` 同帧出现时，先完成旧周期，再开始新周期。
+6. `Idle` 中旧 identity 的 `BreakTouch` 与新 identity 的 `MakeTouch` 同帧出现时，先完成旧周期，再开始新周期。`Starting` / `Owned` 中若有效接触数始终为 1，则视为驱动重分配 identity：转移 `pathIndex/fingerID` 并保持同一个 mouse transaction，禁止发布 up。
 7. 多指接触立即使双击候选失效；三指释放路径仍按本周期最大有效接触数单独处理。
 
 第一 tap 的系统 tap-to-click 完全放行，由 Finder/AppKit 自己完成选择和后台窗口激活。程序不执行 AX 命中测试、不重放首击，也不主动 raise 窗口。
@@ -152,6 +152,7 @@ movement_confirmed
 native_button_passed*  # 第一 tap 的迟到 click，可选
 synthetic_down
 synthetic_drag*
+identity_transferred*  # 持续拖动中硬件重分配 raw identity，可选
 synthetic_up
 chain_reset            # phase 从 releasing 回 idle
 ```
@@ -193,6 +194,7 @@ make release
 10. 多指落下、关闭功能、设置变化、event tap timeout 和退出 app 后没有卡住的鼠标按下。
 11. 普通单击、普通双击和三指拖动无回归。
 12. 内建触控板关闭 dragging、外接 Magic Trackpad 开启 dragging 时，只在内建设备启用替代。
+13. 持续单指拖动中 raw `pathIndex/fingerID` 被重分配时不发布 synthetic up，日志记录 `identity_transferred` 后继续同一 generation。
 
 ## 11. 已知限制
 

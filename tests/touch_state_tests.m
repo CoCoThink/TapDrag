@@ -46,6 +46,38 @@ static void testIdentityBoundary(void) {
     assert(frameReplacesIdentity(&state, replacement, 2));
 }
 
+static void testOwnedIdentityTransfer(void) {
+    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x7777;
+    DeviceState state = {0};
+    state.device = device;
+    state.chainCandidate = YES;
+    state.chainGeneration = 42;
+    state.movementConfirmed = YES;
+    state.touchStartedTimestamp = 10.0;
+    state.pathIndex = 1;
+    state.fingerID = 2;
+    ChainSnapshot owned = {.phase = DragPhaseOwned,
+                           .generation = 42,
+                           .device = device};
+    assert(dragOwnsContinuousContact(&state, device, owned));
+
+    MTTouch replacement = touch(MTTouchStateMakeTouch, 9, 10,
+                                0.6f, 0.7f);
+    replacement.absoluteVector.position = (MTPoint){60.0f, 70.0f};
+    assert(adoptReplacementIdentity(&state, &replacement, 1));
+    assert(state.pathIndex == 9);
+    assert(state.fingerID == 10);
+    assert(state.touchStartedTimestamp == 10.0);
+    assert(state.chainGeneration == 42);
+    assert(state.movementConfirmed);
+
+    owned.phase = DragPhaseCandidate;
+    assert(!dragOwnsContinuousContact(&state, device, owned));
+    owned.phase = DragPhaseOwned;
+    owned.generation = 43;
+    assert(!dragOwnsContinuousContact(&state, device, owned));
+}
+
 static void testMovementIncludesBreakFrame(void) {
     DeviceState state = {0};
     state.touchMade = YES;
@@ -285,6 +317,7 @@ static void testDiagnosticRing(void) {
 int main(void) {
     testTouchCounting();
     testIdentityBoundary();
+    testOwnedIdentityTransfer();
     testMovementIncludesBreakFrame();
     testPhysicalMovementHysteresis();
     testRecognitionWindows();

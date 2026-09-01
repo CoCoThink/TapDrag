@@ -66,6 +66,7 @@ typedef enum {
     DiagnosticRawStart,
     DiagnosticFirstTap,
     DiagnosticSecondContact,
+    DiagnosticIdentityTransfer,
     DiagnosticMovement,
     DiagnosticSyntheticDown,
     DiagnosticSyntheticDrag,
@@ -94,6 +95,7 @@ typedef enum {
     ReasonTapTooLong,
     ReasonTapMoved,
     ReasonIntertapExpired,
+    ReasonIdentityTransfer,
 } DiagnosticReason;
 
 typedef enum { NativePass, NativeFilter, NativeReplaceDrag } NativeDisposition;
@@ -298,6 +300,7 @@ static NSString *kindName(DiagnosticKind kind) {
         case DiagnosticRawStart: return @"raw_contact_started";
         case DiagnosticFirstTap: return @"first_tap";
         case DiagnosticSecondContact: return @"second_contact";
+        case DiagnosticIdentityTransfer: return @"identity_transferred";
         case DiagnosticMovement: return @"movement_confirmed";
         case DiagnosticSyntheticDown: return @"synthetic_down";
         case DiagnosticSyntheticDrag: return @"synthetic_drag";
@@ -329,6 +332,7 @@ static NSString *reasonName(DiagnosticReason reason) {
         case ReasonTapTooLong: return @"tap_too_long";
         case ReasonTapMoved: return @"tap_moved";
         case ReasonIntertapExpired: return @"intertap_expired";
+        case ReasonIdentityTransfer: return @"identity_transfer";
     }
     return @"unknown";
 }
@@ -595,6 +599,28 @@ static BOOL frameReplacesIdentity(const DeviceState *s, const void *contacts, in
         made = made || touches[i].state == MTTouchStateMakeTouch;
     }
     return broke && made;
+}
+
+static BOOL dragOwnsContinuousContact(const DeviceState *s, MTDeviceRef device,
+                                      ChainSnapshot chain) {
+    return s->chainCandidate && s->chainGeneration == chain.generation &&
+        chain.device == device &&
+        (chain.phase == DragPhaseStarting || chain.phase == DragPhaseOwned);
+}
+
+static BOOL adoptReplacementIdentity(DeviceState *s, const void *contacts, int count) {
+    if (contacts == NULL || count <= 0) return NO;
+    const MTTouch *touches = contacts; const MTTouch *replacement = NULL;
+    for (int i = 0; i < count; i++) if (actualTouch(touches[i].state)) {
+        if (replacement != NULL) return NO;
+        replacement = &touches[i];
+    }
+    if (replacement == NULL) return NO;
+    s->pathIndex = replacement->pathIndex; s->fingerID = replacement->fingerID;
+    s->identityValid = YES;
+    s->touchStartedPosition = replacement->normalizedVector.position;
+    s->touchStartedAbsolutePosition = replacement->absoluteVector.position;
+    return YES;
 }
 
 static void observePosition(DeviceState *s, MTPoint position, MTPoint absolutePosition) {
@@ -941,9 +967,17 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
         s->maximumTouching == 1 && s->touchMade && s->identityValid &&
         (!frameContainsIdentity(s, contacts, contactCount) || frameReplacesIdentity(s, contacts, contactCount));
     if (identityChanged) {
-        observeBreak(s, contacts, contactCount); os_unfair_lock_unlock(&gStateLock);
-        contactFrameCallback(device, NULL, 0, timestamp, frame);
-        return contactFrameCallback(device, contacts, contactCount, timestamp, frame);
+        ChainSnapshot chain = chainSnapshot();
+        if (dragOwnsContinuousContact(s, device, chain) &&
+            adoptReplacementIdentity(s, contacts, contactCount)) {
+            recordDiagnostic(DiagnosticIdentityTransfer, ReasonIdentityTransfer,
+                chain.generation, chain.phase, NULL, s->pointerStart,
+                0, s->touchingFrames, 1, s->touchMoved, NO);
+        } else {
+            observeBreak(s, contacts, contactCount); os_unfair_lock_unlock(&gStateLock);
+            contactFrameCallback(device, NULL, 0, timestamp, frame);
+            return contactFrameCallback(device, contacts, contactCount, timestamp, frame);
+        }
     }
     if (count > 0) {
         BOOL started = s->touchingCount == 0;
