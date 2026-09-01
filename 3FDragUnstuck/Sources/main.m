@@ -90,6 +90,10 @@ typedef enum {
     ReasonEventTapDisabled,
     ReasonStale,
     ReasonQuickReleaseAborted,
+    ReasonHold,
+    ReasonTapTooLong,
+    ReasonTapMoved,
+    ReasonIntertapExpired,
 } DiagnosticReason;
 
 typedef enum { NativePass, NativeFilter, NativeReplaceDrag } NativeDisposition;
@@ -100,18 +104,18 @@ typedef struct {
     BOOL touchMade, touchInvalid;
     int touchingFrames;
     double touchStartedTimestamp;
-    MTPoint touchStartedPosition;
+    MTPoint touchStartedPosition, touchStartedAbsolutePosition;
     int32_t pathIndex, fingerID;
     BOOL identityValid;
     CGPoint pointerStart;
     BOOL pointerStartValid;
     BOOL touchMoved;
-    float maximumSquaredDistance;
+    float maximumSquaredDistance, maximumSquaredDistanceMM;
     BOOL firstTapPending;
     double firstTapCompletedTimestamp;
     BOOL chainCandidate;
     unsigned long long chainGeneration;
-    BOOL movementConfirmed, startRequested;
+    BOOL movementConfirmed, holdConfirmed, startRequested;
 } DeviceState;
 
 typedef struct {
@@ -135,7 +139,8 @@ typedef struct {
     uint64_t sequence, machTime, generation, eventTimestamp;
     int64_t wallMillis, eventNumber, sourceUserData;
     int32_t phase, kind, reason, eventType, clickState, x, y;
-    int32_t durationMillis, frames, maximumContacts, moved, invalid;
+    int32_t durationMillis, intertapMillis, motionMilliMillimeters;
+    int32_t frames, maximumContacts, moved, invalid;
     int32_t nativeDragging;
 } DiagnosticRecord;
 
@@ -198,9 +203,11 @@ static NSString *const ModifierFn = @"Fn";
 static const int64_t ThreeFingerTag = 0x334644334655504DLL;
 static const int64_t DoubleTapTag = 0x3346444E45574452LL;
 static const long long MinimumReleaseIntervalMillis = 80;
-static const double MaximumFirstTapDurationSeconds = 0.20;
-static const float MaximumFirstTapMovement = 0.015f;
-static const float MinimumDragMovement = 0.0025f;
+static const long long MaximumSecondTapGapMillis = 600;
+static const long long SecondContactHoldMillis = 180;
+static const double MaximumFirstTapDurationSeconds = 0.25;
+static const float TapMoveThresholdMillimeters = 1.3f;
+static const float FallbackNormalizedMoveThreshold = 0.010f;
 static const long long FirstClickAllowanceMillis = 40;
 
 static long long nowMillis(void) {
@@ -209,6 +216,14 @@ static long long nowMillis(void) {
 
 static long long doubleClickIntervalMillis(void) {
     return MAX(1LL, (long long)([NSEvent doubleClickInterval] * 1000.0));
+}
+
+static long long doubleTapDragGapForSystemMillis(long long systemInterval) {
+    return MIN(MAX(1LL, systemInterval), MaximumSecondTapGapMillis);
+}
+
+static long long doubleTapDragGapMillis(void) {
+    return doubleTapDragGapForSystemMillis(doubleClickIntervalMillis());
 }
 
 static CGEventFlags modifierMaskForName(NSString *name) {
@@ -310,15 +325,19 @@ static NSString *reasonName(DiagnosticReason reason) {
         case ReasonEventTapDisabled: return @"event_tap_disabled";
         case ReasonStale: return @"stale_generation";
         case ReasonQuickReleaseAborted: return @"quick_release_aborted";
+        case ReasonHold: return @"hold_timeout";
+        case ReasonTapTooLong: return @"tap_too_long";
+        case ReasonTapMoved: return @"tap_moved";
+        case ReasonIntertapExpired: return @"intertap_expired";
     }
     return @"unknown";
 }
 
-static void recordDiagnostic(DiagnosticKind kind, DiagnosticReason reason,
-                             unsigned long long generation, DragPhase phase,
-                             CGEventRef event, CGPoint location,
-                             int duration, int frames, int contacts,
-                             BOOL moved, BOOL invalid) {
+static void recordDiagnosticDetails(DiagnosticKind kind, DiagnosticReason reason,
+                                    unsigned long long generation, DragPhase phase,
+                                    CGEventRef event, CGPoint location,
+                                    int duration, int intertap, float motionMillimeters,
+                                    int frames, int contacts, BOOL moved, BOOL invalid) {
     if (!os_unfair_lock_trylock(&gDiagnosticLock)) {
         atomic_fetch_add(&gDroppedRecords, 1);
         return;
@@ -334,12 +353,24 @@ static void recordDiagnostic(DiagnosticKind kind, DiagnosticReason reason,
         .sourceUserData = event == NULL ? 0 : CGEventGetIntegerValueField(event, kCGEventSourceUserData),
         .eventTimestamp = event == NULL ? 0 : CGEventGetTimestamp(event),
         .x = (int32_t)llround(location.x), .y = (int32_t)llround(location.y),
-        .durationMillis = duration, .frames = frames, .maximumContacts = contacts,
+        .durationMillis = duration, .intertapMillis = intertap,
+        .motionMilliMillimeters = isfinite(motionMillimeters)
+            ? (int32_t)llround(motionMillimeters * 1000.0f) : -1,
+        .frames = frames, .maximumContacts = contacts,
         .moved = moved, .invalid = invalid,
         .nativeDragging = atomic_load(&gAnyNativeDraggingEnabled),
     };
     os_unfair_lock_unlock(&gDiagnosticLock);
     atomic_store(&gLoggingDirty, true);
+}
+
+static void recordDiagnostic(DiagnosticKind kind, DiagnosticReason reason,
+                             unsigned long long generation, DragPhase phase,
+                             CGEventRef event, CGPoint location,
+                             int duration, int frames, int contacts,
+                             BOOL moved, BOOL invalid) {
+    recordDiagnosticDetails(kind, reason, generation, phase, event, location,
+                            duration, -1, NAN, frames, contacts, moved, invalid);
 }
 
 static size_t copyRecords(DiagnosticRecord *output, size_t capacity,
@@ -373,7 +404,10 @@ static NSDictionary *recordDictionary(DiagnosticRecord r) {
              @"mouse_event_number": @(r.eventNumber),
              @"source_user_data": @(r.sourceUserData),
              @"event_timestamp": @(r.eventTimestamp), @"x": @(r.x), @"y": @(r.y),
-             @"touch_duration_ms": @(r.durationMillis), @"touching_frames": @(r.frames),
+             @"touch_duration_ms": @(r.durationMillis), @"intertap_ms": @(r.intertapMillis),
+             @"motion_mm": r.motionMilliMillimeters < 0
+                ? @(-1) : @((double)r.motionMilliMillimeters / 1000.0),
+             @"touching_frames": @(r.frames),
              @"maximum_touching_contacts": @(r.maximumContacts),
              @"touch_moved": @(r.moved != 0), @"touch_invalid": @(r.invalid != 0),
              @"native_dragging_enabled": @(r.nativeDragging != 0)};
@@ -388,7 +422,12 @@ static NSString *traceText(NSString *capture) {
     NSDictionary *header = @{@"capture": capture ?: @"unknown", @"pid": @(getpid()),
         @"version": [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"unknown",
         @"build": [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"unknown",
-        @"records": @(count), @"dropped": @(dropped)};
+        @"records": @(count), @"dropped": @(dropped),
+        @"system_double_click_ms": @(doubleClickIntervalMillis()),
+        @"double_tap_drag_gap_ms": @(doubleTapDragGapMillis()),
+        @"first_tap_max_ms": @((int)llround(MaximumFirstTapDurationSeconds * 1000.0)),
+        @"second_contact_hold_ms": @(SecondContactHoldMillis),
+        @"movement_threshold_mm": @(TapMoveThresholdMillimeters)};
     NSMutableArray *objects = [NSMutableArray arrayWithObject:header];
     for (size_t i = 0; i < count; i++) [objects addObject:recordDictionary(records[i])];
     for (NSDictionary *object in objects) {
@@ -511,10 +550,12 @@ static DeviceState *deviceStateLocked(MTDeviceRef device) {
 static void resetCurrentTouch(DeviceState *s) {
     s->touchMade = s->touchInvalid = s->identityValid = s->pointerStartValid = NO;
     s->touchingFrames = 0; s->touchStartedTimestamp = 0;
-    s->touchStartedPosition = (MTPoint){0, 0}; s->pathIndex = s->fingerID = 0;
-    s->pointerStart = CGPointZero; s->touchMoved = NO; s->maximumSquaredDistance = 0;
+    s->touchStartedPosition = s->touchStartedAbsolutePosition = (MTPoint){0, 0};
+    s->pathIndex = s->fingerID = 0;
+    s->pointerStart = CGPointZero; s->touchMoved = NO;
+    s->maximumSquaredDistance = s->maximumSquaredDistanceMM = 0;
     s->chainCandidate = NO; s->chainGeneration = 0;
-    s->movementConfirmed = s->startRequested = NO;
+    s->movementConfirmed = s->holdConfirmed = s->startRequested = NO;
 }
 
 static void resetDevice(DeviceState *s) {
@@ -556,12 +597,18 @@ static BOOL frameReplacesIdentity(const DeviceState *s, const void *contacts, in
     return broke && made;
 }
 
-static void observePosition(DeviceState *s, MTPoint position) {
+static void observePosition(DeviceState *s, MTPoint position, MTPoint absolutePosition) {
     float dx = position.x - s->touchStartedPosition.x;
     float dy = position.y - s->touchStartedPosition.y;
     float distance = dx * dx + dy * dy;
     s->maximumSquaredDistance = MAX(s->maximumSquaredDistance, distance);
-    if (distance >= MinimumDragMovement * MinimumDragMovement) s->touchMoved = YES;
+    float mmX = absolutePosition.x - s->touchStartedAbsolutePosition.x;
+    float mmY = absolutePosition.y - s->touchStartedAbsolutePosition.y;
+    float distanceMM = mmX * mmX + mmY * mmY;
+    if (isfinite(distanceMM)) s->maximumSquaredDistanceMM = MAX(s->maximumSquaredDistanceMM, distanceMM);
+    if (distanceMM >= TapMoveThresholdMillimeters * TapMoveThresholdMillimeters ||
+        distance >= FallbackNormalizedMoveThreshold * FallbackNormalizedMoveThreshold)
+        s->touchMoved = YES;
 }
 
 static void observeBreak(DeviceState *s, const void *contacts, int count) {
@@ -569,7 +616,8 @@ static void observeBreak(DeviceState *s, const void *contacts, int count) {
     const MTTouch *touches = contacts;
     for (int i = 0; i < count; i++) if (touches[i].state == MTTouchStateBreakTouch &&
         touches[i].pathIndex == s->pathIndex && touches[i].fingerID == s->fingerID) {
-        observePosition(s, touches[i].normalizedVector.position); return;
+        observePosition(s, touches[i].normalizedVector.position,
+                        touches[i].absoluteVector.position); return;
     }
 }
 
@@ -584,11 +632,14 @@ static void observeFrame(DeviceState *s, const void *contacts, int count, double
     if (!s->touchMade) {
         s->touchMade = YES; s->touchStartedTimestamp = timestamp;
         s->touchStartedPosition = primary->normalizedVector.position;
+        s->touchStartedAbsolutePosition = primary->absoluteVector.position;
         s->pathIndex = primary->pathIndex; s->fingerID = primary->fingerID;
         s->identityValid = YES; s->pointerStartValid = copyPointerLocation(&s->pointerStart);
     }
     if (primary->state == MTTouchStateTouching) {
-        s->touchingFrames++; observePosition(s, primary->normalizedVector.position);
+        s->touchingFrames++;
+        observePosition(s, primary->normalizedVector.position,
+                        primary->absoluteVector.position);
     }
 }
 
@@ -616,7 +667,7 @@ static BOOL resetChain(unsigned long long generation, DiagnosticReason reason) {
 }
 
 static BOOL beginSecondContact(MTDeviceRef device, CGPoint start, BOOL valid,
-                               unsigned long long *generation) {
+                               int intertapMillis, unsigned long long *generation) {
     os_unfair_lock_lock(&gChainLock); BOOL accepted = gChain.phase == DragPhaseIdle;
     if (accepted) {
         gChain.generation++; gChain.phase = DragPhaseCandidate; gChain.device = device;
@@ -625,13 +676,14 @@ static BOOL beginSecondContact(MTDeviceRef device, CGPoint start, BOOL valid,
         *generation = gChain.generation;
     }
     os_unfair_lock_unlock(&gChainLock);
-    if (accepted) recordDiagnostic(DiagnosticSecondContact, ReasonSecondTap, *generation,
-        DragPhaseCandidate, NULL, start, 0, 0, 1, NO, NO);
+    if (accepted) recordDiagnosticDetails(DiagnosticSecondContact, ReasonSecondTap, *generation,
+        DragPhaseCandidate, NULL, start, 0, intertapMillis, 0, 0, 1, NO, NO);
     return accepted;
 }
 
 static BOOL promoteContact(MTDeviceRef device, unsigned long long generation,
-                           CGPoint latest, BOOL valid, long long *notBefore) {
+                           CGPoint latest, BOOL valid, DiagnosticReason reason,
+                           long long *notBefore) {
     os_unfair_lock_lock(&gChainLock);
     BOOL accepted = gChain.generation == generation && gChain.device == device &&
         (gChain.phase == DragPhaseCandidate || gChain.phase == DragPhaseStarting);
@@ -641,7 +693,7 @@ static BOOL promoteContact(MTDeviceRef device, unsigned long long generation,
         *notBefore = gChain.downNotBeforeMillis;
     }
     os_unfair_lock_unlock(&gChainLock);
-    if (accepted) recordDiagnostic(DiagnosticMovement, ReasonMovement, generation,
+    if (accepted) recordDiagnostic(DiagnosticMovement, reason, generation,
         DragPhaseStarting, NULL, latest, 0, 0, 1, YES, NO);
     return accepted;
 }
@@ -674,7 +726,8 @@ static BOOL finishRelease(unsigned long long generation) {
 }
 
 static BOOL postUp(int64_t number, CGPoint location, unsigned long long generation) {
-    os_unfair_lock_lock(&gSyntheticLock); CGEventRef up = createTaggedEvent(kCGEventLeftMouseUp, location, number);
+    os_unfair_lock_lock(&gSyntheticLock);
+    CGEventRef up = createTaggedEvent(kCGEventLeftMouseUp, location, number);
     if (up != NULL) {
         recordDiagnostic(DiagnosticSyntheticUp, ReasonLift, generation, DragPhaseReleasing,
                          up, location, 0, 0, 0, YES, NO);
@@ -746,6 +799,34 @@ static void scheduleStart(MTDeviceRef device, unsigned long long generation,
     });
 }
 
+static void scheduleHoldPromotion(MTDeviceRef device,
+                                  unsigned long long generation,
+                                  unsigned long long epoch) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 SecondContactHoldMillis * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        BOOL start = NO; long long notBefore = 0;
+        os_unfair_lock_lock(&gStateLock);
+        DeviceState *s = deviceStateLocked(device);
+        if (s != NULL && epoch == atomic_load(&gFeatureEpoch) &&
+            replacementActive(device) && s->touchingCount == 1 &&
+            s->maximumTouching == 1 && !s->touchInvalid &&
+            s->chainCandidate && s->chainGeneration == generation &&
+            !s->movementConfirmed) {
+            CGPoint location; BOOL valid = copyPointerLocation(&location);
+            s->movementConfirmed = promoteContact(device, generation, location,
+                                                  valid, ReasonHold, &notBefore);
+            if (s->movementConfirmed) {
+                s->holdConfirmed = YES;
+                s->startRequested = YES;
+                start = YES;
+            }
+        }
+        os_unfair_lock_unlock(&gStateLock);
+        if (start) scheduleStart(device, generation, notBefore, epoch);
+    });
+}
+
 static void interruptChain(DiagnosticReason reason) {
     unsigned long long generation; int64_t number = 0; CGPoint location = CGPointZero; BOOL up = NO;
     os_unfair_lock_lock(&gChainLock); generation = gChain.generation;
@@ -774,7 +855,8 @@ static BOOL replaceWithDrag(CGEventTapProxy proxy, CGEventRef source, ChainSnaps
         gChain.eventNumber == snapshot.eventNumber;
     if (!current) { os_unfair_lock_unlock(&gChainLock); os_unfair_lock_unlock(&gSyntheticLock); return NO; }
     CGPoint location = CGEventGetLocation(source);
-    CGEventRef drag = createTaggedEvent(kCGEventLeftMouseDragged, location, snapshot.eventNumber);
+    CGEventRef drag = createTaggedEvent(kCGEventLeftMouseDragged, location,
+                                        snapshot.eventNumber);
     if (drag) {
         CGEventSetFlags(drag, CGEventGetFlags(source));
         CGEventSetIntegerValueField(drag, kCGMouseEventDeltaX, CGEventGetIntegerValueField(source, kCGMouseEventDeltaX));
@@ -811,7 +893,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 static void postThreeFingerUp(void) {
     CGPoint location; if (!copyPointerLocation(&location)) return;
-    os_unfair_lock_lock(&gSyntheticLock); CGEventRef up = createTaggedEvent(kCGEventLeftMouseUp, location, 0);
+    os_unfair_lock_lock(&gSyntheticLock);
+    CGEventRef up = createTaggedEvent(kCGEventLeftMouseUp, location, 0);
     if (up) { CGEventSetIntegerValueField(up, kCGEventSourceUserData, ThreeFingerTag); CGEventPost(kCGHIDEventTap, up); CFRelease(up); }
     os_unfair_lock_unlock(&gSyntheticLock);
 }
@@ -828,20 +911,27 @@ static void completeTouch(DeviceState *s, double timestamp, BOOL *candidate,
         s->firstTapPending = NO; atomic_store(&gLastOutcome, ReleaseOutcomeInvalid); reason = ReasonMultiFinger;
     } else if (s->chainCandidate) {
         s->firstTapPending = NO; atomic_store(&gLastOutcome, s->movementConfirmed ? ReleaseOutcomeStarting : ReleaseOutcomeSecondTapNoDrag);
-        reason = s->movementConfirmed ? ReasonMovement : ReasonNoMovement;
+        reason = s->movementConfirmed ? (s->holdConfirmed ? ReasonHold : ReasonMovement) : ReasonNoMovement;
     } else if (s->touchMade && duration <= MaximumFirstTapDurationSeconds * 1000.0 &&
-               s->maximumSquaredDistance <= MaximumFirstTapMovement * MaximumFirstTapMovement) {
+               !s->touchMoved) {
         s->firstTapPending = YES; s->firstTapCompletedTimestamp = timestamp;
         atomic_store(&gLastOutcome, ReleaseOutcomeFirstTap); reason = ReasonFirstTap; kind = DiagnosticFirstTap;
-    } else { s->firstTapPending = NO; s->firstTapCompletedTimestamp = 0; }
-    recordDiagnostic(kind, reason, *generation, chainSnapshot().phase, NULL, s->pointerStart,
-                     duration, s->touchingFrames, s->maximumTouching, s->touchMoved, s->touchInvalid);
+    } else {
+        s->firstTapPending = NO; s->firstTapCompletedTimestamp = 0;
+        if (s->touchMade) reason = duration > MaximumFirstTapDurationSeconds * 1000.0
+            ? ReasonTapTooLong : ReasonTapMoved;
+    }
+    recordDiagnosticDetails(kind, reason, *generation, chainSnapshot().phase,
+                            NULL, s->pointerStart, duration, -1,
+                            sqrtf(s->maximumSquaredDistanceMM), s->touchingFrames,
+                            s->maximumTouching, s->touchMoved, s->touchInvalid);
     resetCurrentTouch(s);
 }
 
 static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactCount,
                                 double timestamp, int frame) {
-    int count = touchingCount(contacts, contactCount); BOOL schedule = NO, ownedUp = NO, interrupt = NO, three = NO;
+    int count = touchingCount(contacts, contactCount);
+    BOOL schedule = NO, scheduleHold = NO, ownedUp = NO, interrupt = NO, three = NO;
     unsigned long long generation = 0, epoch = 0; long long notBefore = 0;
     int64_t number = 0; CGPoint releaseLocation = CGPointZero;
     os_unfair_lock_lock(&gStateLock); DeviceState *s = deviceStateLocked(device);
@@ -864,17 +954,27 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
             if (started && s->touchMade) {
                 recordDiagnostic(DiagnosticRawStart, ReasonNone, 0, chainSnapshot().phase,
                                  NULL, s->pointerStart, 0, 0, count, NO, NO);
-                double interval = (double)doubleClickIntervalMillis() / 1000.0;
-                BOOL recent = s->firstTapPending && timestamp >= s->firstTapCompletedTimestamp &&
-                    timestamp - s->firstTapCompletedTimestamp <= interval;
-                if (recent && beginSecondContact(device, s->pointerStart, s->pointerStartValid, &generation)) {
+                int gap = s->firstTapPending
+                    ? (int)llround((timestamp - s->firstTapCompletedTimestamp) * 1000.0) : -1;
+                BOOL recent = s->firstTapPending && gap >= 0 &&
+                    gap <= doubleTapDragGapMillis();
+                if (recent && beginSecondContact(device, s->pointerStart,
+                                                 s->pointerStartValid, gap,
+                                                 &generation)) {
                     s->chainCandidate = YES; s->chainGeneration = generation;
-                } else if (s->firstTapPending && !recent) { s->firstTapPending = NO; s->firstTapCompletedTimestamp = 0; }
+                    scheduleHold = YES; epoch = atomic_load(&gFeatureEpoch);
+                } else if (s->firstTapPending && !recent) {
+                    recordDiagnosticDetails(DiagnosticReset, ReasonIntertapExpired,
+                        0, chainSnapshot().phase, NULL, s->pointerStart, 0, gap, 0,
+                        0, count, NO, NO);
+                    s->firstTapPending = NO; s->firstTapCompletedTimestamp = 0;
+                }
             }
             if (s->chainCandidate && s->touchMoved) {
                 CGPoint location; BOOL valid = copyPointerLocation(&location);
                 if (!s->movementConfirmed) s->movementConfirmed = promoteContact(device, s->chainGeneration,
-                    location, valid, &notBefore); else if (valid) updateChainLocation(s->chainGeneration, location);
+                    location, valid, ReasonMovement, &notBefore);
+                else if (valid) updateChainLocation(s->chainGeneration, location);
                 if (s->movementConfirmed && !s->startRequested) {
                     s->startRequested = YES; schedule = YES; generation = s->chainGeneration; epoch = atomic_load(&gFeatureEpoch);
                 }
@@ -887,6 +987,7 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
         }
         os_unfair_lock_unlock(&gStateLock);
         if (interrupt) interruptChain(ReasonMultiFinger);
+        if (scheduleHold) scheduleHoldPromotion(device, generation, epoch);
         if (schedule) scheduleStart(device, generation, notBefore, epoch);
         return 0;
     }
@@ -896,7 +997,9 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
         observeBreak(s, contacts, contactCount);
         if (s->chainCandidate && s->touchMoved && !s->movementConfirmed) {
             CGPoint location; BOOL valid = copyPointerLocation(&location);
-            s->movementConfirmed = promoteContact(device, s->chainGeneration, location, valid, &notBefore);
+            s->movementConfirmed = promoteContact(device, s->chainGeneration,
+                                                   location, valid,
+                                                   ReasonMovement, &notBefore);
         }
         BOOL candidate = NO, movement = NO;
         completeTouch(s, timestamp, &candidate, &generation, &movement);

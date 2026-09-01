@@ -53,10 +53,50 @@ static void testMovementIncludesBreakFrame(void) {
     state.pathIndex = 5;
     state.fingerID = 7;
     state.touchStartedPosition = (MTPoint){0.2f, 0.2f};
+    state.touchStartedAbsolutePosition = (MTPoint){20.0f, 20.0f};
     MTTouch end = touch(MTTouchStateBreakTouch, 5, 7, 0.21f, 0.2f);
+    end.absoluteVector.position = (MTPoint){21.4f, 20.0f};
     observeBreak(&state, &end, 1);
     assert(state.touchMoved);
     assert(state.maximumSquaredDistance > 0);
+    assert(state.maximumSquaredDistanceMM > 1.3f * 1.3f);
+}
+
+static void testPhysicalMovementHysteresis(void) {
+    DeviceState state = {0};
+    state.touchStartedPosition = (MTPoint){0.5f, 0.5f};
+    state.touchStartedAbsolutePosition = (MTPoint){50.0f, 30.0f};
+    observePosition(&state, (MTPoint){0.504f, 0.5f},
+                    (MTPoint){50.8f, 30.0f});
+    assert(!state.touchMoved);
+    observePosition(&state, (MTPoint){0.506f, 0.5f},
+                    (MTPoint){51.31f, 30.0f});
+    assert(state.touchMoved);
+}
+
+static void testRecognitionWindows(void) {
+    assert(doubleTapDragGapForSystemMillis(800) == 600);
+    assert(doubleTapDragGapForSystemMillis(528) == 528);
+    assert(doubleTapDragGapForSystemMillis(552) == 552);
+    assert(doubleTapDragGapForSystemMillis(640) == 600);
+    assert(doubleTapDragGapForSystemMillis(300) == 300);
+    assert(doubleTapDragGapForSystemMillis(0) == 1);
+
+    DeviceState accepted = {0};
+    accepted.touchMade = YES;
+    accepted.touchStartedTimestamp = 10.0;
+    accepted.maximumTouching = 1;
+    BOOL candidate = NO, movement = NO;
+    unsigned long long generation = 0;
+    completeTouch(&accepted, 10.24, &candidate, &generation, &movement);
+    assert(accepted.firstTapPending);
+
+    DeviceState rejected = {0};
+    rejected.touchMade = YES;
+    rejected.touchStartedTimestamp = 20.0;
+    rejected.maximumTouching = 1;
+    completeTouch(&rejected, 20.26, &candidate, &generation, &movement);
+    assert(!rejected.firstTapPending);
 }
 
 static void testFirstTapClassification(void) {
@@ -91,7 +131,7 @@ static void testReplacementStateMachine(void) {
     forceIdle();
     MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x1234;
     unsigned long long generation = 0;
-    assert(beginSecondContact(device, CGPointMake(200, 220), YES,
+    assert(beginSecondContact(device, CGPointMake(200, 220), YES, 175,
                               &generation));
     ChainSnapshot snapshot = chainSnapshot();
     assert(snapshot.phase == DragPhaseCandidate);
@@ -99,6 +139,7 @@ static void testReplacementStateMachine(void) {
 
     long long downNotBefore = 0;
     assert(promoteContact(device, generation, CGPointMake(210, 230), YES,
+                          ReasonMovement,
                           &downNotBefore));
     assert(chainSnapshot().phase == DragPhaseStarting);
     assert(downNotBefore > 0);
@@ -117,7 +158,7 @@ static void testOwnedReleaseOwnership(void) {
     forceIdle();
     MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x5678;
     unsigned long long generation = 0;
-    assert(beginSecondContact(device, CGPointMake(300, 320), YES,
+    assert(beginSecondContact(device, CGPointMake(300, 320), YES, 180,
                               &generation));
     os_unfair_lock_lock(&gChainLock);
     gChain.phase = DragPhaseOwned;
@@ -141,10 +182,10 @@ static void testStaleGenerationCannotReleaseNewDrag(void) {
     forceIdle();
     MTDeviceRef device = (MTDeviceRef)(uintptr_t)0xabcd;
     unsigned long long oldGeneration = 0;
-    assert(beginSecondContact(device, CGPointZero, YES, &oldGeneration));
+    assert(beginSecondContact(device, CGPointZero, YES, 100, &oldGeneration));
     assert(resetChain(oldGeneration, ReasonDisabled));
     unsigned long long currentGeneration = 0;
-    assert(beginSecondContact(device, CGPointZero, YES,
+    assert(beginSecondContact(device, CGPointZero, YES, 100,
                               &currentGeneration));
     assert(currentGeneration != oldGeneration);
     int64_t eventNumber = 0;
@@ -245,6 +286,8 @@ int main(void) {
     testTouchCounting();
     testIdentityBoundary();
     testMovementIncludesBreakFrame();
+    testPhysicalMovementHysteresis();
+    testRecognitionWindows();
     testFirstTapClassification();
     testReplacementStateMachine();
     testOwnedReleaseOwnership();

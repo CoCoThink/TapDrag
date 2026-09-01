@@ -51,16 +51,16 @@ macOS 没有公开的独立参数用于缩短 Without Drag Lock 的抬手等待�
 
 - 当前有效接触数和本周期最大接触数。
 - `MakeTouch` / `Touching` 起点、时间、`pathIndex` 和 `fingerID`。
-- raw 归一化坐标的最大平方位移。
+- raw 归一化坐标和 `absoluteVector` 毫米坐标的最大平方位移。
 - 第一个短 tap 的完成时间。
 - 当前第二触所属的 chain generation。
 
 规则：
 
 1. 只有 `MakeTouch` 和 `Touching` 算作手指仍在表面。`BreakTouch`、linger 和 out-of-range 不得延迟释放。
-2. 第一 tap 最长 `0.20s`，最大归一化位移 `0.015`。
-3. 第二触必须在系统 double-click interval 内开始。
-4. 第二触只有越过 `0.0025` raw 位移后才成为拖动；停留不动的第二 tap 不合成 down/up。
+2. 第一 tap 最长 `0.25s`，移动不得超过下述 tap movement threshold。
+3. 第二触必须在 `min(system double-click interval, 600ms)` 内开始。上限来自本机实测：`528–552ms` 的真实双击拖动必须接受，而之前出现误判的 `640ms` 和 `721ms` 必须拒绝。
+4. 第二触进入 `dragging-or-doubletap` 歧义状态。移动超过 `1.3mm` 时立即确认拖动；未越过阈值但持续触摸 `180ms` 时也确认拖动；在此之前抬手仍是普通双击，不合成 down/up。
 5. `BreakTouch` 的最终位置必须参与位移判断，覆盖只在最后一帧移动的快速拖放。
 6. 旧 identity 的 `BreakTouch` 与新 identity 的 `MakeTouch` 同帧出现时，先完成旧周期，再开始新周期。
 7. 多指接触立即使双击候选失效；三指释放路径仍按本周期最大有效接触数单独处理。
@@ -72,8 +72,8 @@ macOS 没有公开的独立参数用于缩短 Without Drag Lock 的抬手等待�
 | phase | 含义 | 合法转换 |
 | --- | --- | --- |
 | `Idle` | 没有受控拖动。 | 有效第二触开始后进入 `Candidate`。 |
-| `Candidate` | 第二触存在，但尚未确认移动。 | 移动后进入 `Starting`；无移动抬手回 `Idle`。 |
-| `Starting` | 已确认移动，等待发布 synthetic down。 | 发布成功进入 `Owned`；若先抬手则进入 `Releasing`。 |
+| `Candidate` | 第二触存在，仍可能是普通双击。 | 移动超过 `1.3mm` 或按住 `180ms` 后进入 `Starting`；此前抬手回 `Idle`。 |
+| `Starting` | 已确认拖动，等待发布 synthetic down。 | 发布成功进入 `Owned`；若先抬手则进入 `Releasing`。 |
 | `Owned` | 程序拥有完整鼠标事务。 | raw 抬手进入 `Releasing`。 |
 | `Releasing` | 唯一 up owner 正在完成释放。 | up 发布后直接回 `Idle`。 |
 
@@ -83,7 +83,7 @@ macOS 没有公开的独立参数用于缩短 Without Drag Lock 的抬手等待�
 
 第二触开始时记录屏幕坐标，并设置 `downNotBefore = now + 40ms`。这 40ms 只给第一 tap 的原生 click 一次送达 Finder/AppKit 的机会，不影响抬手释放速度。
 
-raw 位移确认后，starter 使用同一个 `kCGEventSourceStateCombinedSessionState` source 和正数 15-bit event number 发布：
+毫米位移或按住超时确认后，starter 使用同一个 `kCGEventSourceStateCombinedSessionState` source 和正数 15-bit event number 发布：
 
 ```text
 tagged leftMouseDown(clickState=1)
@@ -156,7 +156,13 @@ synthetic_up
 chain_reset            # phase 从 releasing 回 idle
 ```
 
-重点字段包括 generation、phase、kind/reason、event type、event number、source user data、坐标、raw 时长/帧数/最大接触数/位移，以及 native dragging 设置。日志不记录文件名、窗口标题、键盘文本或 raw touch identity。
+重点字段包括 generation、phase、kind/reason、event type、event number、source user data、坐标、raw 时长、两击间隔、毫米位移、帧数、最大接触数，以及 native dragging 设置。header 同时记录系统双击间隔和本次实际采用的识别阈值。日志不记录文件名、窗口标题、键盘文本或 raw touch identity。
+
+阈值和歧义状态参考 libinput 的 tap-and-drag 实现：短 tap 使用独立超时、移动以物理毫米计算，并在第二触期间区分普通双击与拖动。这里没有复制其 Linux 事件层代码，只采用同类判定原则；macOS raw 数据来自 `MultitouchSupport.framework` 的 `absoluteVector`（毫米坐标）。参考：
+
+- <https://wayland.freedesktop.org/libinput/doc/latest/tapping.html>
+- <https://gitlab.freedesktop.org/libinput/libinput/-/blob/main/src/evdev-mt-touchpad-tap.c>
+- <https://github.com/lauschue/Remotastic/blob/main/MultitouchSupport.h>
 
 ## 9. 构建和签名
 
@@ -181,8 +187,8 @@ make release
 4. 文件 1 拖完后第一次尝试即可拖动文件 2。
 5. 前台窗口 1 拖完后第一次尝试即可拖动后层窗口 2，且不会双击缩放。
 6. 双击拖动后第一次按压点击 `3F+` 即弹出菜单。
-7. 第二 tap 不移动时不出现 synthetic down。
-8. 极快短距离拖放在 BreakTouch 最后一帧越过阈值时仍能识别。
+7. 第二 tap 在 `180ms` 内抬手且不移动时不出现 synthetic down；持续按住超过 `180ms` 后可正常起拖。
+8. 极快短距离拖放在 BreakTouch 最后一帧越过 `1.3mm` 时仍能识别。
 9. `Starting` 阶段快速抬手不会留下按下状态或生成普通 click。
 10. 多指落下、关闭功能、设置变化、event tap timeout 和退出 app 后没有卡住的鼠标按下。
 11. 普通单击、普通双击和三指拖动无回归。

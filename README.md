@@ -59,7 +59,7 @@ The recommended mode therefore removes the native recognizer from this gesture a
 3. Enable **Double-Tap Drag Replacement (Experimental)** in the `3F+` menu.
 4. Confirm that the status row says **Double-Tap Drag: Full replacement ready**.
 
-The first tap remains a normal macOS tap-to-click, preserving Finder selection and background-window activation. The app detects the second raw one-finger contact, waits for real movement, then publishes one complete tagged `down -> dragged -> up` transaction. Raw finger lift owns the up and returns the state machine directly to `Idle`; there is no native tap-to-drag grace or shadow session to clean up. A 40ms start allowance lets the normal first click reach Finder/AppKit before the synthetic drag down, but it does not delay release.
+The first tap remains a normal macOS tap-to-click, preserving Finder selection and background-window activation. The app accepts the second contact for at most 600ms (or the shorter system double-click interval), then keeps it in an ambiguous double-click-or-drag state. It becomes a drag only after the finger moves 1.3mm or remains down for 180ms. This physical hysteresis rejects contact jitter without losing slow drag starts. The app then publishes one complete tagged `down -> dragged -> up` transaction. Raw finger lift owns the up and returns the state machine directly to `Idle`; there is no native tap-to-drag grace or shadow session to clean up. A 40ms start allowance lets the normal first click reach Finder/AppKit before the synthetic drag down, but it does not delay release.
 
 If native trackpad dragging remains enabled, the replacement stays inactive and does not filter or synthesize double-tap drag events. There is no legacy compatibility or shadow path.
 
