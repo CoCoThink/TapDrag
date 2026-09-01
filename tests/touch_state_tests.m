@@ -107,12 +107,19 @@ static void testPhysicalMovementHysteresis(void) {
 }
 
 static void testRecognitionWindows(void) {
-    assert(doubleTapDragGapForSystemMillis(800) == 600);
-    assert(doubleTapDragGapForSystemMillis(528) == 528);
-    assert(doubleTapDragGapForSystemMillis(552) == 552);
-    assert(doubleTapDragGapForSystemMillis(640) == 600);
-    assert(doubleTapDragGapForSystemMillis(300) == 300);
+    assert(doubleTapDragGapForSystemMillis(800) == 160);
+    assert(doubleTapDragGapForSystemMillis(528) == 160);
+    assert(doubleTapDragGapForSystemMillis(552) == 160);
+    assert(doubleTapDragGapForSystemMillis(640) == 160);
+    assert(doubleTapDragGapForSystemMillis(300) == 160);
+    assert(doubleTapDragGapForSystemMillis(100) == 100);
     assert(doubleTapDragGapForSystemMillis(0) == 1);
+    assert(!secondContactGapIsValid(0, 600));
+    assert(!secondContactGapIsValid(29, 600));
+    assert(secondContactGapIsValid(30, 600));
+    assert(secondContactGapIsValid(112, 160));
+    assert(secondContactGapIsValid(160, 160));
+    assert(!secondContactGapIsValid(168, 160));
 
     DeviceState accepted = {0};
     accepted.touchMade = YES;
@@ -129,6 +136,21 @@ static void testRecognitionWindows(void) {
     rejected.maximumTouching = 1;
     completeTouch(&rejected, 20.26, &candidate, &generation, &movement);
     assert(!rejected.firstTapPending);
+}
+
+static void testIdentityRestartCannotBecomeSecondContact(void) {
+    DeviceState state = {0};
+    state.touchMade = YES;
+    state.touchStartedTimestamp = 10.0;
+    state.maximumTouching = 1;
+    BOOL candidate = NO, movement = NO;
+    unsigned long long generation = 0;
+    completeTouch(&state, 10.08, &candidate, &generation, &movement);
+    assert(state.firstTapPending);
+
+    long long sameFrameGap = llround((10.08 - state.firstTapCompletedTimestamp) * 1000.0);
+    assert(sameFrameGap == 0);
+    assert(!secondContactGapIsValid(sameFrameGap, 600));
 }
 
 static void testFirstTapClassification(void) {
@@ -157,6 +179,14 @@ static void testFirstTapClassification(void) {
     completeTouch(&state, 11.02, &candidate, &generation, &movement);
     assert(!state.firstTapPending);
     assert(atomic_load(&gLastOutcome) == ReleaseOutcomeInvalid);
+
+    state.touchMade = YES;
+    state.touchStartedTimestamp = 12.0;
+    state.maximumTouching = 1;
+    state.nativeButtonDownDuringTouch = YES;
+    completeTouch(&state, 12.08, &candidate, &generation, &movement);
+    assert(!state.firstTapPending);
+    assert(atomic_load(&gLastOutcome) == ReleaseOutcomeWaiting);
 }
 
 static void testReplacementStateMachine(void) {
@@ -321,6 +351,7 @@ int main(void) {
     testMovementIncludesBreakFrame();
     testPhysicalMovementHysteresis();
     testRecognitionWindows();
+    testIdentityRestartCannotBecomeSecondContact();
     testFirstTapClassification();
     testReplacementStateMachine();
     testOwnedReleaseOwnership();
