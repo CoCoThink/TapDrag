@@ -1,8 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
-APP_PATH="${1:-build/3FDragUnstuck.app}"
-LOCAL_IDENTITY="${THREE_F_DRAG_LOCAL_SIGNING_IDENTITY:-3FDragUnstuck Local Development}"
+APP_PATH="${1:-build/TapDrag.app}"
+LOCAL_IDENTITY="${TAPDRAG_LOCAL_SIGNING_IDENTITY:-3FDragUnstuck Local Development}"
 
 echo "Available Code Signing identities:"
 security find-identity -p codesigning

@@ -3,18 +3,20 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT_DIR/../build"
-APP_DIR="$BUILD_DIR/3FDragUnstuck.app"
+APP_DIR="$BUILD_DIR/TapDrag.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
-DEFAULT_LOCAL_SIGNING_IDENTITY="${THREE_F_DRAG_LOCAL_SIGNING_IDENTITY:-3FDragUnstuck Local Development}"
-SIGNING_IDENTITY="${THREE_F_DRAG_CODESIGN_IDENTITY:-$DEFAULT_LOCAL_SIGNING_IDENTITY}"
+# Keep the established certificate as the default so the renamed app retains
+# the same designated requirement and existing macOS privacy grants.
+DEFAULT_LOCAL_SIGNING_IDENTITY="${TAPDRAG_LOCAL_SIGNING_IDENTITY:-3FDragUnstuck Local Development}"
+SIGNING_IDENTITY="${TAPDRAG_CODESIGN_IDENTITY:-$DEFAULT_LOCAL_SIGNING_IDENTITY}"
 
 if [[ "$SIGNING_IDENTITY" != "-" ]] && ! security find-identity -p codesigning | grep -F -q "\"$SIGNING_IDENTITY\""; then
   echo "The requested Code Signing identity is unavailable: $SIGNING_IDENTITY" >&2
   echo "For this machine, run 'make setup-local-signing' once." >&2
-  echo "For an Apple-issued identity, set THREE_F_DRAG_CODESIGN_IDENTITY explicitly." >&2
-  echo "For a temporary ad-hoc build only, use THREE_F_DRAG_CODESIGN_IDENTITY=- make build." >&2
+  echo "For an Apple-issued identity, set TAPDRAG_CODESIGN_IDENTITY explicitly." >&2
+  echo "For a temporary ad-hoc build only, use TAPDRAG_CODESIGN_IDENTITY=- make build." >&2
   exit 2
 fi
 
@@ -26,15 +28,13 @@ clang \
   -fobjc-arc \
   -mmacosx-version-min=13.0 \
   "$ROOT_DIR/Sources/main.m" \
-  -o "$MACOS_DIR/3FDragUnstuck" \
+  -o "$MACOS_DIR/TapDrag" \
   -framework AppKit \
   -framework ApplicationServices \
-  -framework CoreGraphics \
-  -framework CoreFoundation \
   -framework UniformTypeIdentifiers
 
 cp -X "$ROOT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
-cp -X "$ROOT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+cp -X "$ROOT_DIR/Resources/AppIcon.png" "$RESOURCES_DIR/AppIcon.png"
 printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
 
 xattr -cr "$APP_DIR"

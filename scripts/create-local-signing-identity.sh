@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 
-IDENTITY_NAME="${THREE_F_DRAG_LOCAL_SIGNING_IDENTITY:-3FDragUnstuck Local Development}"
+IDENTITY_NAME="${TAPDRAG_LOCAL_SIGNING_IDENTITY:-3FDragUnstuck Local Development}"
 KEYCHAIN="$(security default-keychain -d user | sed -E 's/^[[:space:]]*"(.*)"[[:space:]]*$/\1/')"
 
 if [[ -z "$KEYCHAIN" || ! -f "$KEYCHAIN" ]]; then
@@ -24,9 +24,9 @@ if security find-certificate -a -c "$IDENTITY_NAME" -Z "$KEYCHAIN" | \
     exit 1
 fi
 
-TEMP_DIR="$(mktemp -d "${TMPDIR%/}/3FDragUnstuck-signing.XXXXXX")"
+TEMP_DIR="$(mktemp -d "${TMPDIR%/}/TapDrag-signing.XXXXXX")"
 cleanup() {
-    if [[ -d "$TEMP_DIR" && "$TEMP_DIR" == "${TMPDIR%/}/3FDragUnstuck-signing."* ]]; then
+    if [[ -d "$TEMP_DIR" && "$TEMP_DIR" == "${TMPDIR%/}/TapDrag-signing."* ]]; then
         rm -rf "$TEMP_DIR"
     fi
 }

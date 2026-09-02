@@ -1,5 +1,5 @@
-#define main threeFDragUnstuckApplicationMain
-#include "../3FDragUnstuck/Sources/main.m"
+#define main tapDragApplicationMain
+#include "../TapDrag/Sources/main.m"
 #undef main
 
 #include <assert.h>
@@ -46,7 +46,7 @@ static void testIdentityBoundary(void) {
     assert(frameReplacesIdentity(&state, replacement, 2));
 }
 
-static void testOwnedIdentityTransfer(void) {
+static void testContinuousIdentityTransfer(void) {
     MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x7777;
     DeviceState state = {0};
     state.device = device;
@@ -59,7 +59,7 @@ static void testOwnedIdentityTransfer(void) {
     ChainSnapshot owned = {.phase = DragPhaseOwned,
                            .generation = 42,
                            .device = device};
-    assert(dragOwnsContinuousContact(&state, device, owned));
+    assert(contactCanTransferIdentity(&state, device, owned));
 
     MTTouch replacement = touch(MTTouchStateMakeTouch, 9, 10,
                                 0.6f, 0.7f);
@@ -72,10 +72,26 @@ static void testOwnedIdentityTransfer(void) {
     assert(state.movementConfirmed);
 
     owned.phase = DragPhaseCandidate;
-    assert(!dragOwnsContinuousContact(&state, device, owned));
+    assert(contactCanTransferIdentity(&state, device, owned));
+    owned.phase = DragPhaseStarting;
+    assert(contactCanTransferIdentity(&state, device, owned));
     owned.phase = DragPhaseOwned;
     owned.generation = 43;
-    assert(!dragOwnsContinuousContact(&state, device, owned));
+    assert(!contactCanTransferIdentity(&state, device, owned));
+
+    DeviceState firstContact = {0};
+    firstContact.touchMade = YES;
+    firstContact.touchStartedTimestamp = 20.0;
+    firstContact.firstTapPending = YES;
+    ChainSnapshot idle = {.phase = DragPhaseIdle};
+    assert(contactCanTransferIdentity(&firstContact, device, idle));
+    assert(adoptReplacementIdentity(&firstContact, &replacement, 1));
+    assert(firstContact.touchStartedTimestamp == 20.0);
+    assert(firstContact.firstTapPending);
+
+    owned.phase = DragPhaseReleasing;
+    owned.generation = 42;
+    assert(!contactCanTransferIdentity(&state, device, owned));
 }
 
 static void testMovementIncludesBreakFrame(void) {
@@ -104,6 +120,21 @@ static void testPhysicalMovementHysteresis(void) {
     observePosition(&state, (MTPoint){0.506f, 0.5f},
                     (MTPoint){51.31f, 30.0f});
     assert(state.touchMoved);
+
+    DeviceState physicalWins = {0};
+    physicalWins.touchStartedPosition = (MTPoint){0.5f, 0.5f};
+    physicalWins.touchStartedAbsolutePosition = (MTPoint){50.0f, 30.0f};
+    observePosition(&physicalWins, (MTPoint){0.52f, 0.5f},
+                    (MTPoint){50.92f, 30.0f});
+    assert(!physicalWins.touchMoved);
+
+    DeviceState fallback = {0};
+    fallback.touchStartedPosition = (MTPoint){0.5f, 0.5f};
+    fallback.touchStartedAbsolutePosition = (MTPoint){NAN, NAN};
+    observePosition(&fallback, (MTPoint){0.52f, 0.5f},
+                    (MTPoint){NAN, NAN});
+    assert(fallback.touchMoved);
+
 }
 
 static void testRecognitionWindows(void) {
@@ -244,7 +275,8 @@ static void testStaleGenerationCannotReleaseNewDrag(void) {
     forceIdle();
     MTDeviceRef device = (MTDeviceRef)(uintptr_t)0xabcd;
     unsigned long long oldGeneration = 0;
-    assert(beginSecondContact(device, CGPointZero, YES, 100, &oldGeneration));
+    assert(beginSecondContact(device, CGPointZero, YES, 100,
+                              &oldGeneration));
     assert(resetChain(oldGeneration, ReasonDisabled));
     unsigned long long currentGeneration = 0;
     assert(beginSecondContact(device, CGPointZero, YES, 100,
@@ -268,6 +300,8 @@ static void testNativeEventPolicy(void) {
            NativePass);
 
     snapshot.phase = DragPhaseStarting;
+    assert(dispositionForEvent(snapshot, kCGEventLeftMouseDragged) ==
+           NativePass);
     assert(dispositionForEvent(snapshot, kCGEventLeftMouseUp) ==
            NativePass);
 
@@ -286,6 +320,48 @@ static void testNativeEventPolicy(void) {
     snapshot.eventNumber = 0;
     assert(dispositionForEvent(snapshot, kCGEventLeftMouseDown) ==
            NativePass);
+    forceIdle();
+}
+
+static void testGlobalNativeMovementMutation(void) {
+    forceIdle();
+    os_unfair_lock_lock(&gChainLock);
+    gChain.generation = 100;
+    gChain.phase = DragPhaseOwned;
+    gChain.eventNumber = 72;
+    os_unfair_lock_unlock(&gChainLock);
+    ChainSnapshot snapshot = {.phase = DragPhaseOwned,
+                              .generation = 100,
+                              .eventNumber = 72};
+    CGEventRef movement = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                                  CGPointMake(11, 21),
+                                                  kCGMouseButtonLeft);
+    assert(movement != NULL);
+    CGEventSetIntegerValueField(movement, kCGEventTargetUnixProcessID, 4106);
+    CGEventSetIntegerValueField(movement,
+        kCGEventTargetProcessSerialNumber, 9876);
+    CGEventSetIntegerValueField(movement,
+        kCGMouseEventWindowUnderMousePointer, 1234);
+    CGEventSetIntegerValueField(movement,
+        kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent, 1235);
+    assert(prepareNativeMovementAsDrag(movement, snapshot));
+    assert(CGEventGetType(movement) == kCGEventLeftMouseDragged);
+    assert(ownEvent(movement));
+    assert(CGEventGetIntegerValueField(movement,
+        kCGMouseEventNumber) == 72);
+    assert(CGEventGetIntegerValueField(movement,
+        kCGMouseEventClickState) == 1);
+    // The global path preserves the native event's routing/source metadata.
+    assert(CGEventGetIntegerValueField(movement,
+        kCGEventTargetUnixProcessID) == 4106);
+    assert(CGEventGetIntegerValueField(movement,
+        kCGEventTargetProcessSerialNumber) == 9876);
+    assert(CGEventGetIntegerValueField(movement,
+        kCGMouseEventWindowUnderMousePointer) == 1234);
+    assert(CGEventGetIntegerValueField(movement,
+        kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent) == 1235);
+    CFRelease(movement);
+    forceIdle();
 }
 
 static BOOL fakeDeviceIsBuiltIn(MTDeviceRef device) {
@@ -305,9 +381,10 @@ static void testDeviceSpecificDraggingPreferences(void) {
 }
 
 static void testSyntheticEventMetadata(void) {
-    gSyntheticSource = CGEventSourceCreate(
-        kCGEventSourceStateCombinedSessionState);
+    gSyntheticSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     assert(gSyntheticSource != NULL);
+    assert(CGEventSourceGetSourceStateID(gSyntheticSource) ==
+           kCGEventSourceStateHIDSystemState);
     CGEventRef down = createTaggedEvent(kCGEventLeftMouseDown,
                                         CGPointMake(10, 20),
                                         42);
@@ -315,6 +392,10 @@ static void testSyntheticEventMetadata(void) {
     assert(ownEvent(down));
     assert(CGEventGetIntegerValueField(down, kCGMouseEventNumber) == 42);
     assert(CGEventGetIntegerValueField(down, kCGMouseEventClickState) == 1);
+    assert(CGEventGetIntegerValueField(down, kCGEventSourceStateID) ==
+           kCGEventSourceStateHIDSystemState);
+    assert(CGEventGetIntegerValueField(down, kCGEventSourceUnixProcessID) ==
+           getpid());
     CFRelease(down);
 
     gNextEventNumber = SyntheticEventNumberMaximum;
@@ -347,7 +428,7 @@ static void testDiagnosticRing(void) {
 int main(void) {
     testTouchCounting();
     testIdentityBoundary();
-    testOwnedIdentityTransfer();
+    testContinuousIdentityTransfer();
     testMovementIncludesBreakFrame();
     testPhysicalMovementHysteresis();
     testRecognitionWindows();
@@ -357,6 +438,7 @@ int main(void) {
     testOwnedReleaseOwnership();
     testStaleGenerationCannotReleaseNewDrag();
     testNativeEventPolicy();
+    testGlobalNativeMovementMutation();
     testDeviceSpecificDraggingPreferences();
     testSyntheticEventMetadata();
     testDiagnosticRing();
