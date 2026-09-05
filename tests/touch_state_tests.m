@@ -223,7 +223,6 @@ static void testFirstTapClassification(void) {
     assert(state.firstTapCompletedTimestamp == 10.05);
     assert(state.firstTapCompletedUptime > 0);
     assert(state.firstTapPointerValid);
-    assert(atomic_load(&gLastOutcome) == ReleaseOutcomeFirstTap);
 
     state.touchMade = YES;
     state.touchStartedTimestamp = 11.0;
@@ -233,7 +232,6 @@ static void testFirstTapClassification(void) {
     assert(!state.firstTapPending);
     assert(state.firstTapCompletedUptime == 0);
     assert(!state.firstTapPointerValid);
-    assert(atomic_load(&gLastOutcome) == ReleaseOutcomeInvalid);
 
     state.touchMade = YES;
     state.touchStartedTimestamp = 12.0;
@@ -241,7 +239,6 @@ static void testFirstTapClassification(void) {
     state.nativeButtonDownDuringTouch = YES;
     completeTouch(&state, 12.08, &candidate, &generation, &movement);
     assert(!state.firstTapPending);
-    assert(atomic_load(&gLastOutcome) == ReleaseOutcomeWaiting);
 }
 
 static void testReplacementStateMachine(void) {
@@ -352,58 +349,33 @@ static void clearPostedEvents(void) {
     postedEventCount = 0;
 }
 
-@interface TestRunningApplication : NSObject
-@property(copy) NSString *bundleIdentifier;
-@property(assign) pid_t processIdentifier;
-@property(assign, getter=isTerminated) BOOL terminated;
-@end
-@implementation TestRunningApplication
-@end
-
-static void testPortCallback(CFMachPortRef port, void *message, CFIndex size, void *info) {
-    (void)port; (void)message; (void)size; (void)info;
+static void setFirstTapCandidate(DeviceState *state, MTDeviceRef device,
+                                 CGPoint pointer, uint64_t completedUptime) {
+    *state = (DeviceState){
+        .device = device,
+        .firstTapPending = YES,
+        .firstTapCompletedUptime = completedUptime,
+        .firstTapPointer = pointer,
+        .firstTapPointerValid = YES,
+    };
 }
 
-@interface TestWeChatDelegate : AppDelegate
-@property(assign) int observerInstallCount;
-@property(assign) pid_t lastObserverPid;
-@property(assign) BOOL failObserver;
-@end
-@implementation TestWeChatDelegate
-- (void)installTargetObserverForPid:(pid_t)pid {
-    ++self.observerInstallCount;
-    self.lastObserverPid = pid;
-    if (self.failObserver) return;
-    // A local port exercises lifecycle cleanup without installing a desktop tap.
-    gTargetObserverTap = CFMachPortCreate(NULL, testPortCallback, NULL, NULL);
-    assert(gTargetObserverTap);
-    atomic_store(&gObservedTargetPid, pid);
-}
-@end
-
-static void notifyTestApplication(AppDelegate *delegate, NSString *name,
-                                  TestRunningApplication *app) {
-    [delegate trackedApplicationChanged:[NSNotification notificationWithName:name
-        object:nil userInfo:@{NSWorkspaceApplicationKey: app}]];
-}
-
-static void testSpecialFirstTapBuffer(void) {
+static void testFirstTapBuffer(void) {
     forceIdle();
-    atomic_store(&gFirstTapBufferMode, FirstTapBufferCompatibility);
     MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x7779;
     DeviceState savedDevices[MaximumDevices];
     memcpy(savedDevices, gDevices, sizeof(gDevices));
     int savedCount = gDeviceCount;
     gDeviceCount = 1;
-    gDevices[0] = (DeviceState){.device = device, .firstTapPending = YES};
     atomic_store(&gEnabled, true);
-    atomic_store(&gWeChatPid, 23013);
     atomic_store(&gInternalDraggingPresent, true);
     atomic_store(&gInternalDraggingEnabled, false);
     atomic_store(&gBluetoothDraggingPresent, false);
     gSyntheticSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     CGPoint pointer = CGPointZero;
     assert(copyPointerLocation(&pointer));
+    setFirstTapCandidate(&gDevices[0], device, pointer,
+                         clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
                                              pointer, kCGMouseButtonLeft);
     CGEventRef up = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
@@ -425,20 +397,20 @@ static void testSpecialFirstTapBuffer(void) {
     assert(postedEventCount == 2);
     clearPostedEvents();
 
-    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseUp, up));
     CGEventSetIntegerValueField(down, kCGMouseEventNumber, 78);
     CGEventSetIntegerValueField(up, kCGMouseEventNumber, 78);
     CGEventSetIntegerValueField(down, kCGMouseEventClickState, 2);
-    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseUp, up));
     assert(postedEventCount == 4);
     assert(CGEventGetIntegerValueField(postedEvents[2], kCGMouseEventClickState) == 2);
     assert(CGEventGetType(postedEvents[3]) == kCGEventLeftMouseUp);
     clearPostedEvents();
 
-    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseUp, up));
     token = gBufferedTapToken;
     gChain = (DragChain){.generation = 500, .phase = DragPhaseStarting, .device = device,
         .start = CGPointMake(10, 20), .latest = CGPointMake(40, 20),
@@ -456,122 +428,29 @@ static void testSpecialFirstTapBuffer(void) {
 
     CGEventSetLocation(down, CGPointMake(pointer.x + 50, pointer.y));
     CGEventSetLocation(up, CGPointMake(pointer.x + 50, pointer.y));
-    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
+    setFirstTapCandidate(&gDevices[0], device, CGEventGetLocation(down),
+                         clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseUp, up));
     expireBufferedTap(gBufferedTapToken);
     assert(postedEventCount == 3);
     assert(CGEventGetType(postedEvents[2]) == kCGEventMouseMoved);
     assert(CGPointEqualToPoint(CGEventGetLocation(postedEvents[2]), pointer));
     clearPostedEvents();
 
-    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 999);
-    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23013);
-    TestWeChatDelegate *delegate = [TestWeChatDelegate new];
-    delegate.trackingTargets = YES;
-    TestRunningApplication *oldApp = [TestRunningApplication new];
-    oldApp.bundleIdentifier = @"com.tencent.xinWeChat";
-    oldApp.processIdentifier = 23013;
-    oldApp.terminated = YES;
-    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
-    token = gBufferedTapToken;
-    notifyTestApplication(delegate, NSWorkspaceDidTerminateApplicationNotification, oldApp);
-    assert(atomic_load(&gWeChatPid) == 0);
-    assert(gBufferedTapDown == NULL && gBufferedTapUp == NULL);
-    expireBufferedTap(token);
-    assert(postedEventCount == 0);
-    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-
-    TestRunningApplication *newApp = [TestRunningApplication new];
-    newApp.bundleIdentifier = @"com.tencent.xinWeChat";
-    newApp.processIdentifier = 23014;
-    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, newApp);
-    assert(atomic_load(&gWeChatPid) == 23014);
-    assert(atomic_load(&gObservedTargetPid) == 23014);
-    assert(delegate.lastObserverPid == 23014 && delegate.observerInstallCount == 1);
-    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23014);
-    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
-    token = gBufferedTapToken;
-    notifyTestApplication(delegate, NSWorkspaceDidActivateApplicationNotification, newApp);
-    notifyTestApplication(delegate, NSWorkspaceDidTerminateApplicationNotification, oldApp);
-    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, oldApp);
-    assert(gBufferedTapToken == token && gBufferedTapDown);
-    assert(atomic_load(&gWeChatPid) == 23014 && delegate.observerInstallCount == 1);
-
-    TestRunningApplication *otherApp = [TestRunningApplication new];
-    otherApp.bundleIdentifier = @"com.apple.finder";
-    otherApp.processIdentifier = 42;
-    notifyTestApplication(delegate, NSWorkspaceDidActivateApplicationNotification, otherApp);
-    assert(atomic_load(&gWeChatPid) == 23014 && gBufferedTapToken == token);
-
-    // A missed exit notification still requires clearing the old process's
-    // pending click, and observer failure must not disable the new PID filter.
-    newApp.processIdentifier = 23015;
-    delegate.failObserver = YES;
-    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, newApp);
-    assert(gBufferedTapDown == NULL && gTargetObserverTap == NULL);
-    assert(atomic_load(&gWeChatPid) == 23015 && atomic_load(&gObservedTargetPid) == 0);
-    expireBufferedTap(token);
-    assert(postedEventCount == 0);
-    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23015);
-    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
-    token = gBufferedTapToken;
-    delegate.failObserver = NO;
-    notifyTestApplication(delegate, NSWorkspaceDidActivateApplicationNotification, newApp);
-    assert(atomic_load(&gObservedTargetPid) == 23015);
-    assert(delegate.observerInstallCount == 3 && gBufferedTapToken == token);
-    TestRunningApplication *dock = [TestRunningApplication new];
-    dock.bundleIdentifier = @"com.apple.dock";
-    dock.processIdentifier = 568;
-    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, dock);
-    assert(atomic_load(&gDockPid) == 568);
-    assert(pidRequiresFirstClickBuffer(568));
-    assert(!pidRequiresFirstClickBuffer(569));
-    TestRunningApplication *newDock = [TestRunningApplication new];
-    newDock.bundleIdentifier = @"com.apple.dock";
-    newDock.processIdentifier = 570;
-    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, newDock);
-    notifyTestApplication(delegate, NSWorkspaceDidTerminateApplicationNotification, dock);
-    assert(atomic_load(&gDockPid) == 570);
-
-    [delegate stopTrackingTargets];
-    assert(atomic_load(&gWeChatPid) == 0 && atomic_load(&gObservedTargetPid) == 0);
-    assert(atomic_load(&gDockPid) == 0);
-    assert(gTargetObserverTap == NULL && gBufferedTapDown == NULL);
-    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, newApp);
-    assert(atomic_load(&gWeChatPid) == 0);
-    expireBufferedTap(token);
-    assert(postedEventCount == 0);
-
-    atomic_store(&gWeChatPid, 23013);
-    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23013);
+    setFirstTapCandidate(&gDevices[0], device, pointer,
+                         clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     atomic_store(&gInternalDraggingEnabled, true);
-    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
     CFRelease(down); CFRelease(up); CFRelease(gSyntheticSource);
     gSyntheticSource = NULL;
     atomic_store(&gEnabled, false);
-    atomic_store(&gWeChatPid, 0);
     memcpy(gDevices, savedDevices, sizeof(gDevices));
     gDeviceCount = savedCount;
     forceIdle();
 }
 
-static void setUniversalCandidate(DeviceState *state, MTDeviceRef device,
-                                  CGPoint pointer, uint64_t completedUptime) {
-    *state = (DeviceState){
-        .device = device,
-        .firstTapPending = YES,
-        .firstTapCompletedUptime = completedUptime,
-        .firstTapPointer = pointer,
-        .firstTapPointerValid = YES,
-    };
-}
-
-static void testUniversalFirstTapBuffer(void) {
+static void testFirstTapCorrelation(void) {
     forceIdle();
     DeviceState savedDevices[MaximumDevices];
     memcpy(savedDevices, gDevices, sizeof(gDevices));
@@ -581,8 +460,7 @@ static void testUniversalFirstTapBuffer(void) {
     assert(copyPointerLocation(&pointer));
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     gDeviceCount = 1;
-    setUniversalCandidate(&gDevices[0], device, pointer, now);
-    atomic_store(&gFirstTapBufferMode, FirstTapBufferUniversal);
+    setFirstTapCandidate(&gDevices[0], device, pointer, now);
     atomic_store(&gEnabled, true);
     atomic_store(&gInternalDraggingPresent, true);
     atomic_store(&gInternalDraggingEnabled, false);
@@ -598,53 +476,37 @@ static void testUniversalFirstTapBuffer(void) {
     CGEventSetIntegerValueField(down, kCGMouseEventSubtype, NSEventSubtypeTouch);
     CGEventSetIntegerValueField(down, kCGMouseEventNumber, 91);
     CGEventSetIntegerValueField(up, kCGMouseEventNumber, 91);
-    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
-    assert(gBufferedTapTargetPid == 999);
-    TestWeChatDelegate *delegate = [TestWeChatDelegate new];
-    delegate.failObserver = YES;
-    atomic_store(&gWeChatPid, 23013);
-    [delegate updateWeChatPid:23014];
-    assert(gBufferedTapDown && gBufferedTapTargetPid == 999);
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseUp, up));
     expireBufferedTap(gBufferedTapToken);
     assert(postedEventCount == 2);
     clearPostedEvents();
 
-    gReplayedButtonNumber = 92;
-    gReplayedButtonTargetPid = 999;
-    [delegate updateWeChatPid:23015];
-    assert(gReplayedButtonNumber == 92 && gReplayedButtonTargetPid == 999);
-    atomic_store(&gWeChatPid, 999);
-    [delegate updateWeChatPid:0];
-    assert(gReplayedButtonNumber == 0 && gReplayedButtonTargetPid == 0);
-
     uint64_t maximumAge = (uint64_t)(doubleTapDragGapMillis() +
         FirstClickAllowanceMillis) * NSEC_PER_MSEC;
-    setUniversalCandidate(&gDevices[0], device, pointer,
-                          clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - maximumAge - NSEC_PER_MSEC);
-    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    setFirstTapCandidate(&gDevices[0], device, pointer,
+                         clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - maximumAge - NSEC_PER_MSEC);
+    assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
 
-    setUniversalCandidate(&gDevices[0], device, pointer,
-                          clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    setFirstTapCandidate(&gDevices[0], device, pointer,
+                         clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     CGEventSetLocation(down, CGPointMake(pointer.x +
         MaximumFirstTapEventDistancePoints + 1.0, pointer.y));
-    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
     CGEventSetLocation(down, pointer);
 
     CGEventSetIntegerValueField(down, kCGMouseEventSubtype, 0);
-    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
     CGEventSetIntegerValueField(down, kCGMouseEventSubtype, NSEventSubtypeTouch);
 
     gDeviceCount = 2;
-    setUniversalCandidate(&gDevices[1], (MTDeviceRef)(uintptr_t)0x7781,
-                          pointer, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
-    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    setFirstTapCandidate(&gDevices[1], (MTDeviceRef)(uintptr_t)0x7781,
+                         pointer, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
 
     CFRelease(down); CFRelease(up); CFRelease(gSyntheticSource);
     gSyntheticSource = NULL;
     atomic_store(&gEnabled, false);
-    atomic_store(&gWeChatPid, 0);
-    atomic_store(&gFirstTapBufferMode, FirstTapBufferCompatibility);
     memcpy(gDevices, savedDevices, sizeof(gDevices));
     gDeviceCount = savedCount;
     forceIdle();
@@ -772,18 +634,15 @@ static void testDownstreamObserverDoesNotChangeOwnership(void) {
     gChain.phase = DragPhaseOwned;
     gChain.eventNumber = 92;
     os_unfair_lock_unlock(&gChainLock);
-    // A leaked native move must be visible at both observer stages, but the
-    // observers must neither consume it nor turn it into another drag.
+    // A leaked native move must be visible to diagnostics, but the observer
+    // must neither consume it nor turn it into another drag.
     assert(downstreamObserverCallback(NULL, kCGEventMouseMoved, event, NULL) == event);
-    assert(downstreamObserverCallback(NULL, kCGEventMouseMoved, event,
-                                     (void *)(uintptr_t)1) == event);
     assert(CGEventGetType(event) == kCGEventMouseMoved);
     count = copyRecords(records, 8, NULL);
-    assert(count == 5);
+    assert(count == 4);
     assert(records[3].kind == DiagnosticDownstreamObserved);
-    assert(records[4].kind == DiagnosticTargetObserved);
-    assert(records[4].generation == chainSnapshot().generation);
-    assert(records[4].eventType == kCGEventMouseMoved);
+    assert(records[3].generation == chainSnapshot().generation);
+    assert(records[3].eventType == kCGEventMouseMoved);
     downstreamObserverCallback(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
     assert(chainSnapshot().phase == DragPhaseOwned);
     atomic_store(&gEnabled, false);
@@ -852,16 +711,11 @@ static void testDiagnosticRing(void) {
     assert(records[0].generation == 99);
     assert(records[0].kind == DiagnosticSecondContact);
     assert(records[1].moved == YES);
-    assert(validatedFirstTapBufferMode(-1) == FirstTapBufferCompatibility);
-    assert(validatedFirstTapBufferMode(FirstTapBufferUniversal) ==
-           FirstTapBufferUniversal);
-    atomic_store(&gFirstTapBufferMode, FirstTapBufferUniversal);
     NSString *text = traceText(@"test");
     assert([text containsString:@"\"second_contact\""]);
     assert([text containsString:@"\"movement_confirmed\""]);
-    assert([text containsString:@"\"first_tap_buffer_mode\":\"universal\""]);
-    assert([text containsString:@"\"diagnostic_schema\":4"]);
-    atomic_store(&gFirstTapBufferMode, FirstTapBufferCompatibility);
+    assert([text containsString:@"\"first_click_allowance_ms\":20"]);
+    assert([text containsString:@"\"diagnostic_schema\":5"]);
 }
 
 int main(void) {
@@ -878,8 +732,8 @@ int main(void) {
     testOwnedReleaseOwnership();
     testStaleGenerationCannotReleaseNewDrag();
     testNativeEventPolicy();
-    testSpecialFirstTapBuffer();
-    testUniversalFirstTapBuffer();
+    testFirstTapBuffer();
+    testFirstTapCorrelation();
     testSerializedDragTransaction();
     testDownstreamObserverDoesNotChangeOwnership();
     testDeviceSpecificDraggingPreferences();

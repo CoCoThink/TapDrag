@@ -6,11 +6,11 @@ TapDrag is a lightweight macOS menu bar utility that provides double-tap draggin
 
 - Recognizes a short tap followed by a second one-finger contact.
 - Starts dragging only after the second contact moves far enough or is deliberately held.
-- Preserves normal clicks with selectable compatibility or universal first-tap buffering.
+- Preserves normal clicks with global first-tap buffering for matched trackpad taps.
 - Sends one complete tagged `mouseDown -> mouseDragged -> mouseUp` transaction.
 - Releases immediately on the real raw finger lift.
 - Keeps a bounded automatic diagnostic trace for difficult gesture failures.
-- Handles drag input at the HID stage and observes downstream events for compatibility diagnostics.
+- Handles drag input at the HID stage and observes downstream events for diagnostics.
 
 ## Requirements
 
@@ -31,15 +31,13 @@ TapDrag uses Apple's private `MultitouchSupport.framework` to observe raw trackp
 
 Check `Launch at Login` in the menu to start TapDrag automatically when you log in to macOS; uncheck it to disable automatic startup. The menu reflects the current system setting each time it opens. A dash means macOS approval is pending; use `Approve Launch at Login...` to open Login Items settings. This setting is independent of `Enabled`.
 
-The `First Tap Buffering` submenu selects how TapDrag resolves the first tap before a possible drag. `Compatibility (WeChat & Dock)` preserves the original behavior and is the default. `Universal (All Trackpad Taps)` applies the same decision window to every uniquely matched raw trackpad tap. Universal mode adds roughly 200 ms to ordinary tap-to-click actions; physical trackpad presses and mouse clicks remain immediate. The selection persists across launches.
+TapDrag applies the same first-tap decision window to every uniquely matched raw trackpad tap. This adds roughly 180 ms to ordinary tap-to-click actions. Physical trackpad presses, mouse clicks, and clicks that cannot be uniquely correlated with a raw tap remain immediate.
 
 The first contact must be a short, stationary tap. The second contact must begin 30–160 ms after the first raw lift. Movement beyond 1.3 mm confirms the drag immediately; a stationary 180 ms hold can also confirm deliberate drag intent. Multi-finger contact invalidates the candidate.
 
-Buffered tap clicks have a roughly 200 ms decision window. Confirming a drag cancels the buffered first click; otherwise the click is replayed. Real double-clicks are replayed in order. Compatibility mode tracks WeChat and Dock launches and exits automatically, including when either process starts after TapDrag. Restarting them does not require restarting TapDrag.
+Buffered tap clicks have a roughly 180 ms decision window. Confirming a drag cancels the buffered first click; otherwise the click is replayed. Real double-clicks are replayed in order.
 
-Launchpad and Dock icons use the same first-tap decision window. TapDrag tracks the Dock process that owns both surfaces. This adds a roughly 200 ms delay to ordinary tap clicks on Dock and Launchpad icons, allowing a second contact to turn the gesture into a drag before the application launches.
-
-On 2026-09-05, the user confirmed with a physical trackpad that double-tap text selection works in WeChat 4.1.11 and icon dragging works in both Launchpad and the Dock on macOS 15.7.7. WeChat window dragging still requires separate confirmation. See the [diagnosis and validation record](docs/WECHAT-DRAG-DIAGNOSIS.md).
+The same global path applies in applications, Launchpad, and the Dock. The delay prevents the first tap from selecting content or launching an application before a second contact can turn the gesture into a drag.
 
 ## Build
 
