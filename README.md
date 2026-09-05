@@ -6,7 +6,7 @@ TapDrag is a lightweight macOS menu bar utility that provides double-tap draggin
 
 - Recognizes a short tap followed by a second one-finger contact.
 - Starts dragging only after the second contact moves far enough or is deliberately held.
-- Preserves normal clicks. In WeChat, the first tap is briefly buffered so a drag does not become a double-click.
+- Preserves normal clicks. In WeChat, Launchpad, and the Dock, the first tap is briefly buffered so immediate click handling does not prevent a drag.
 - Sends one complete tagged `mouseDown -> mouseDragged -> mouseUp` transaction.
 - Releases immediately on the real raw finger lift.
 - Keeps a bounded automatic diagnostic trace for difficult gesture failures.
@@ -35,7 +35,9 @@ The first contact must be a short, stationary tap. The second contact must begin
 
 WeChat tap clicks have a roughly 200 ms decision window. Confirming a drag cancels the buffered first click; otherwise the click is replayed. Real double-clicks are replayed in order. TapDrag tracks WeChat launches and exits automatically, including when WeChat starts after TapDrag. Restarting WeChat does not require restarting TapDrag.
 
-On 2026-09-05, the user confirmed that double-tap text selection works with a physical trackpad in WeChat 4.1.11 on macOS 15.7.7. WeChat window dragging still requires separate confirmation. See the [diagnosis and validation record](docs/WECHAT-DRAG-DIAGNOSIS.md).
+Launchpad and Dock icons use the same first-tap decision window. TapDrag tracks the Dock process that owns both surfaces. This adds a roughly 200 ms delay to ordinary tap clicks on Dock and Launchpad icons, allowing a second contact to turn the gesture into a drag before the application launches.
+
+On 2026-09-05, the user confirmed with a physical trackpad that double-tap text selection works in WeChat 4.1.11 and icon dragging works in both Launchpad and the Dock on macOS 15.7.7. WeChat window dragging still requires separate confirmation. See the [diagnosis and validation record](docs/WECHAT-DRAG-DIAGNOSIS.md).
 
 ## Build
 

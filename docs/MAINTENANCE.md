@@ -36,7 +36,7 @@ TapDrag 只负责一件事：在 macOS 原生触控板拖移关闭时，实现�
 
 - `MultitouchSupport.framework` 的 raw contact frame，决定真实接触开始、移动、身份变化和抬起。
 - HID event tap 的鼠标事件，在应用拥有拖动事务后过滤冲突事件。拥有事务时消费原生 movement，将替代拖动与 down/up 在同一锁保护下从 HID 发布。
-- annotated-session 主动按钮过滤器仅对微信暂存 raw 首击；确认拖动时取消首击，否则补发普通点击。其他应用的首击正常放行。
+- annotated-session 主动按钮过滤器仅对微信和 Dock 进程暂存 raw 首击；确认拖动时取消首击，否则补发普通点击。Launchpad 由 Dock 承载，因此自动覆盖；其他应用的首击正常放行。
 - annotated-session 层的只读观察器仅记录下游事件，不参与拖动状态迁移；观察器失效不能中断拖动。
 
 输出是一条带 `DoubleTapTag` 的完整事务：
@@ -119,8 +119,9 @@ Diagnostics 子菜单中的 `Automatic Logging` 控制自动文件写入，默�
 - `input_event_tap` 和 `downstream_observer_active` 标明输入层级与观察器状态；`movement_input` 保留改写前事件，`observed_downstream` 记录下游观察，`delta_x/y` 保留移动增量。
 - schema 2 增加 `event_flags`、`button_number`、`mouse_subtype`、`hid_left_down`、`session_left_down`，并记录原生拖动作为对照。左键状态是回调时的采样值。
 - `wechat_pid` 表示当前首击缓冲目标，`target_observer_pid` 表示当前只读观察器绑定的微信进程，二者在诊断摘要中分别报告。`observed_target_process` 为该进程路由点的只读观察；不做窗口移动特判。
+- Launchpad 启动器 `com.apple.launchpad.launcher` 不常驻，实际界面由 Dock 进程承载。`dock_pid` 由启动时枚举和 NSWorkspace 启动/退出通知维护。按钮事件的目标 PID 等于当前 Dock PID 时统一启用首击缓冲，覆盖 Launchpad 和普通 Dock 图标；其代价是两处普通 tap 点击约 200 ms 后才执行。不得依赖 `LPSpringboard` 窗口名称：该字段在 TapDrag 进程中并非可靠可用。Dock PID 更换时清除旧点击和 timer token，迟到的旧进程退出通知不得清除新 PID。
 - 在主线程监听 NSWorkspace 的应用启动、退出和激活通知，按微信 Bundle ID 更新目标 PID。安装事件过滤器时先订阅通知再枚举现有进程，支持微信晚于 TapDrag 启动。PID 改变时丢弃旧点击缓冲、使旧超时任务失效并移除旧观察器；微信退出后不得向其他窗口补发旧点击。迟到的旧进程退出通知不得清除新 PID。观察器安装失败不影响首击缓冲，后续微信激活时重试；卸载过滤器时注销通知并清理目标。
-- 微信首击缓冲使用独立的 annotated-session 主动按钮过滤器，以此阶段的目标 PID 判定应用，避免 HID 阶段仍指向旧前台应用。raw 首击已结束且系统原生拖移关闭时，暂存首击 down/up；约 200 ms 内没有进入第二接触则补发，确认拖动后丢弃首击。单击补发后恢复当前指针位置；真正双击的按钮事件统一发布，避免第二次 down 越过首击补发。
+- 专用首击缓冲使用独立的 annotated-session 主动按钮过滤器，以此阶段的目标 PID 判定应用，避免 HID 阶段仍指向旧前台应用。raw 首击已结束且系统原生拖移关闭时，暂存首击 down/up；约 200 ms 内没有进入第二接触则补发，确认拖动后丢弃首击。单击补发后恢复当前指针位置；真正双击的按钮事件统一发布，避免第二次 down 越过首击补发。
 - 缓冲及补发与拖动共用 `gSyntheticLock`。该锁内允许取得 `gChainLock`，不得反向取 `gStateLock`。缓冲超时以 token 使旧回调失效；关闭功能、tap 失效时补发尚未提交的点击。`wechat_first_tap_buffer` 标识此路径；缓冲记录为 `native_event_filtered / first_tap`，确认拖动取消首击为 `native_event_filtered / second_tap`，补发为 `native_button_passed / first_tap`。
 
 `synthetic_down/drag/up` 仍表示发布或改写，不是应用接收回执。释放后观察到的事件可能以 generation 0 记录，需用本会话中的 tag、event number 和时间顺序关联；下游观察也不能证明窗口已经移动。
@@ -163,7 +164,10 @@ make verify
 13. 微信通过 Command+Q 退出再打开，或在 TapDrag 启动后才打开微信，双击文字拖选仍正常；无需重启 TapDrag。
 14. `Launch at Login` 可启用和关闭；系统设置中修改登录项后，重新打开菜单能反映状态。需批准时显示设置入口。注销并重新登录后验证启动行为。
 15. `Automatic Logging` 关闭后不再更新磁盘日志，复制与导出仍包含内存记录；重新启动应用后保持选择。再次开启会创建新的自动日志文件。
+16. Launchpad 和 Dock 中第一次 tap 不会提前启动应用，双击拖动可移动图标；普通 tap 在约 200 ms 后仍能启动应用。重启 Dock 后两项行为保持不变。
 
 2026-09-05 验收记录：用户确认微信 4.1.11 / macOS 15.7.7 上的真实触控板双击文字拖选恢复正常；实际首击缓冲路径的输入框回放、`make verify` 和手动探针严格编译均通过。微信窗口拖动及普通单击、双击的实机回归尚未获得用户明确确认；自动化点击顺序测试通过不代表上述手工矩阵全部完成。根因、对照数据和复现命令见 [微信诊断记录](WECHAT-DRAG-DIAGNOSIS.md)。
+
+同日 Launchpad / Dock 验收记录：事件探针确认 Launchpad 的 annotated-session 鼠标 down/up 均以当前 Dock PID 为目标，窗口编号一致且 subtype 为触控；用户随后确认修复版在 Launchpad 和 Dock 中均可正常双击拖动图标。最终实现按当前 Dock PID 统一缓冲首击，不依赖窗口名称。`make verify` 已通过，包括 Dock PID 初始跟踪、重启更新、迟到退出通知和非 Dock PID 不匹配的回归测试。普通 tap 的约 200 ms 延迟是为区分拖动而保留的预期行为。
 
 若改动图标，编译并运行 `scripts/generate-app-icon.m` 生成 1024×1024 PNG，再执行完整构建确认 Finder 和菜单栏显示正常。

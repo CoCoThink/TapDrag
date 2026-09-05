@@ -202,6 +202,7 @@ static CFMachPortRef gTargetObserverTap = NULL;
 static CFRunLoopSourceRef gTargetObserverTapSource = NULL;
 static atomic_int gObservedTargetPid = 0;
 static atomic_int gWeChatPid = 0;
+static atomic_int gDockPid = 0;
 // Protected by gSyntheticLock; native first clicks must not precede a
 // replacement drag in applications that recognize double-clicks themselves.
 static CGEventRef gBufferedTapDown = NULL, gBufferedTapUp = NULL;
@@ -498,7 +499,9 @@ static NSString *traceText(NSString *capture) {
         @"drag_delivery": @"serialized_hid_post",
         @"synthetic_mouse_subtype": @(NSEventSubtypeTouch),
         @"wechat_first_tap_buffer": @YES,
+        @"dock_first_tap_buffer": @YES,
         @"wechat_pid": @(atomic_load(&gWeChatPid)),
+        @"dock_pid": @(atomic_load(&gDockPid)),
         @"downstream_observer_active": @(atomic_load(&gObserverActive)),
         @"target_observer_pid": @(atomic_load(&gObservedTargetPid)),
         @"diagnostic_schema": @3,
@@ -914,12 +917,21 @@ static void expireBufferedTap(unsigned long long token) {
     os_unfair_lock_unlock(&gSyntheticLock);
 }
 
-static BOOL bufferWeChatTapButton(CGEventType type, CGEventRef event) {
+static BOOL pidRequiresFirstClickBuffer(pid_t targetPid) {
+    return (targetPid > 0 && targetPid == atomic_load(&gWeChatPid)) ||
+        (targetPid > 0 && targetPid == atomic_load(&gDockPid));
+}
+
+static BOOL eventTargetRequiresFirstClickBuffer(CGEventRef event) {
+    pid_t targetPid = (pid_t)CGEventGetIntegerValueField(event,
+                                                         kCGEventTargetUnixProcessID);
+    return pidRequiresFirstClickBuffer(targetPid);
+}
+
+static BOOL bufferSpecialTapButton(CGEventType type, CGEventRef event) {
     if (type != kCGEventLeftMouseDown && type != kCGEventLeftMouseUp) return NO;
     MTDeviceRef device = NULL;
-    int wechatPid = atomic_load(&gWeChatPid);
-    if (type == kCGEventLeftMouseDown && wechatPid > 0 &&
-        CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID) == wechatPid &&
+    if (type == kCGEventLeftMouseDown &&
         CGEventGetIntegerValueField(event, kCGMouseEventSubtype) == NSEventSubtypeTouch) {
         os_unfair_lock_lock(&gStateLock);
         for (int i = 0; i < gDeviceCount; ++i) {
@@ -930,6 +942,7 @@ static BOOL bufferWeChatTapButton(CGEventType type, CGEventRef event) {
             }
         }
         os_unfair_lock_unlock(&gStateLock);
+        if (device && !eventTargetRequiresFirstClickBuffer(event)) device = NULL;
     }
     os_unfair_lock_lock(&gSyntheticLock);
     int64_t number = CGEventGetIntegerValueField(event, kCGMouseEventNumber);
@@ -1176,7 +1189,7 @@ static CGEventRef clickBufferCallback(CGEventTapProxy proxy, CGEventType type,
         return event;
     }
     if (!event || ownEvent(event) || !atomic_load(&gEnabled)) return event;
-    return bufferWeChatTapButton(type, event) ? NULL : event;
+    return bufferSpecialTapButton(type, event) ? NULL : event;
 }
 
 static CGEventRef downstreamObserverCallback(CGEventTapProxy proxy, CGEventType type,
@@ -1364,7 +1377,7 @@ static CGEventMask diagnosticMouseMask(void) {
 @property(strong) NSMenuItem *automaticLoggingItem;
 @property(assign) CFArrayRef deviceList;
 @property(assign) void *multitouchHandle;
-@property(assign) BOOL trackingWeChat;
+@property(assign) BOOL trackingTargets;
 @end
 
 @implementation AppDelegate
@@ -1418,30 +1431,43 @@ static CGEventMask diagnosticMouseMask(void) {
     }
 }
 
-- (void)weChatApplicationChanged:(NSNotification *)notification {
+- (void)updateDockPid:(pid_t)pid {
+    if (atomic_load(&gDockPid) == pid) return;
+    os_unfair_lock_lock(&gSyntheticLock);
+    discardBufferedTapLocked();
+    gReplayedButtonNumber = 0;
+    atomic_store(&gDockPid, pid);
+    os_unfair_lock_unlock(&gSyntheticLock);
+}
+
+- (void)trackedApplicationChanged:(NSNotification *)notification {
     if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self weChatApplicationChanged:notification]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self trackedApplicationChanged:notification]; });
         return;
     }
-    if (!self.trackingWeChat) return;
+    if (!self.trackingTargets) return;
     NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
-    if (![app.bundleIdentifier isEqualToString:@"com.tencent.xinWeChat"]) return;
+    BOOL isWeChat = [app.bundleIdentifier isEqualToString:@"com.tencent.xinWeChat"];
+    BOOL isDock = [app.bundleIdentifier isEqualToString:@"com.apple.dock"];
+    if (!isWeChat && !isDock) return;
     if ([notification.name isEqualToString:NSWorkspaceDidTerminateApplicationNotification]) {
         // A delayed termination for the old PID must not clear its replacement.
-        if (app.processIdentifier == atomic_load(&gWeChatPid)) [self updateWeChatPid:0];
+        if (isWeChat && app.processIdentifier == atomic_load(&gWeChatPid)) [self updateWeChatPid:0];
+        if (isDock && app.processIdentifier == atomic_load(&gDockPid)) [self updateDockPid:0];
     } else if (!app.terminated) {
-        [self updateWeChatPid:app.processIdentifier];
+        if (isWeChat) [self updateWeChatPid:app.processIdentifier];
+        if (isDock) [self updateDockPid:app.processIdentifier];
     }
 }
 
-- (void)startTrackingWeChat {
-    if (!self.trackingWeChat) {
-        self.trackingWeChat = YES;
+- (void)startTrackingTargets {
+    if (!self.trackingTargets) {
+        self.trackingTargets = YES;
         NSNotificationCenter *center = NSWorkspace.sharedWorkspace.notificationCenter;
         for (NSString *name in @[NSWorkspaceDidLaunchApplicationNotification,
                                 NSWorkspaceDidTerminateApplicationNotification,
                                 NSWorkspaceDidActivateApplicationNotification]) {
-            [center addObserver:self selector:@selector(weChatApplicationChanged:) name:name object:nil];
+            [center addObserver:self selector:@selector(trackedApplicationChanged:) name:name object:nil];
         }
     }
     pid_t pid = 0;
@@ -1449,12 +1475,18 @@ static CGEventMask diagnosticMouseMask(void) {
         if (!app.terminated) { pid = app.processIdentifier; break; }
     }
     [self updateWeChatPid:pid];
+    pid = 0;
+    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"]) {
+        if (!app.terminated) { pid = app.processIdentifier; break; }
+    }
+    [self updateDockPid:pid];
 }
 
-- (void)stopTrackingWeChat {
-    self.trackingWeChat = NO;
+- (void)stopTrackingTargets {
+    self.trackingTargets = NO;
     [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self];
     [self updateWeChatPid:0];
+    [self updateDockPid:0];
     [self removeTargetObserver];
 }
 
@@ -1496,12 +1528,12 @@ static CGEventMask diagnosticMouseMask(void) {
     if (!atomic_load(&gObserverActive))
         recordDiagnostic(DiagnosticFailure, ReasonObserverUnavailable, 0, DragPhaseIdle,
                          NULL, CGPointZero, 0, 0, 0, NO, NO);
-    [self startTrackingWeChat];
+    [self startTrackingTargets];
     return YES;
 }
 
 - (void)removeEventTap {
-    [self stopTrackingWeChat];
+    [self stopTrackingTargets];
     if (gClickTapSource) { CFRunLoopRemoveSource(CFRunLoopGetMain(), gClickTapSource, kCFRunLoopCommonModes); CFRelease(gClickTapSource); gClickTapSource = NULL; }
     if (gClickTap) { CFMachPortInvalidate(gClickTap); CFRelease(gClickTap); gClickTap = NULL; }
     atomic_store(&gObserverActive, false);

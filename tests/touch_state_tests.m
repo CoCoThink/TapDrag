@@ -379,11 +379,11 @@ static void testPortCallback(CFMachPortRef port, void *message, CFIndex size, vo
 
 static void notifyTestApplication(AppDelegate *delegate, NSString *name,
                                   TestRunningApplication *app) {
-    [delegate weChatApplicationChanged:[NSNotification notificationWithName:name
+    [delegate trackedApplicationChanged:[NSNotification notificationWithName:name
         object:nil userInfo:@{NSWorkspaceApplicationKey: app}]];
 }
 
-static void testWeChatFirstTapBuffer(void) {
+static void testSpecialFirstTapBuffer(void) {
     forceIdle();
     MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x7779;
     DeviceState savedDevices[MaximumDevices];
@@ -420,20 +420,20 @@ static void testWeChatFirstTapBuffer(void) {
     assert(postedEventCount == 2);
     clearPostedEvents();
 
-    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
     CGEventSetIntegerValueField(down, kCGMouseEventNumber, 78);
     CGEventSetIntegerValueField(up, kCGMouseEventNumber, 78);
     CGEventSetIntegerValueField(down, kCGMouseEventClickState, 2);
-    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
     assert(postedEventCount == 4);
     assert(CGEventGetIntegerValueField(postedEvents[2], kCGMouseEventClickState) == 2);
     assert(CGEventGetType(postedEvents[3]) == kCGEventLeftMouseUp);
     clearPostedEvents();
 
-    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
     token = gBufferedTapToken;
     gChain = (DragChain){.generation = 500, .phase = DragPhaseStarting, .device = device,
         .start = CGPointMake(10, 20), .latest = CGPointMake(40, 20),
@@ -451,8 +451,8 @@ static void testWeChatFirstTapBuffer(void) {
 
     CGEventSetLocation(down, CGPointMake(pointer.x + 50, pointer.y));
     CGEventSetLocation(up, CGPointMake(pointer.x + 50, pointer.y));
-    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
     expireBufferedTap(gBufferedTapToken);
     assert(postedEventCount == 3);
     assert(CGEventGetType(postedEvents[2]) == kCGEventMouseMoved);
@@ -460,23 +460,23 @@ static void testWeChatFirstTapBuffer(void) {
     clearPostedEvents();
 
     CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 999);
-    assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
     CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23013);
     TestWeChatDelegate *delegate = [TestWeChatDelegate new];
-    delegate.trackingWeChat = YES;
+    delegate.trackingTargets = YES;
     TestRunningApplication *oldApp = [TestRunningApplication new];
     oldApp.bundleIdentifier = @"com.tencent.xinWeChat";
     oldApp.processIdentifier = 23013;
     oldApp.terminated = YES;
-    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
     token = gBufferedTapToken;
     notifyTestApplication(delegate, NSWorkspaceDidTerminateApplicationNotification, oldApp);
     assert(atomic_load(&gWeChatPid) == 0);
     assert(gBufferedTapDown == NULL && gBufferedTapUp == NULL);
     expireBufferedTap(token);
     assert(postedEventCount == 0);
-    assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
 
     TestRunningApplication *newApp = [TestRunningApplication new];
     newApp.bundleIdentifier = @"com.tencent.xinWeChat";
@@ -485,10 +485,10 @@ static void testWeChatFirstTapBuffer(void) {
     assert(atomic_load(&gWeChatPid) == 23014);
     assert(atomic_load(&gObservedTargetPid) == 23014);
     assert(delegate.lastObserverPid == 23014 && delegate.observerInstallCount == 1);
-    assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
     CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23014);
-    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
     token = gBufferedTapToken;
     notifyTestApplication(delegate, NSWorkspaceDidActivateApplicationNotification, newApp);
     notifyTestApplication(delegate, NSWorkspaceDidTerminateApplicationNotification, oldApp);
@@ -512,15 +512,30 @@ static void testWeChatFirstTapBuffer(void) {
     expireBufferedTap(token);
     assert(postedEventCount == 0);
     CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23015);
-    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
-    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferSpecialTapButton(kCGEventLeftMouseUp, up));
     token = gBufferedTapToken;
     delegate.failObserver = NO;
     notifyTestApplication(delegate, NSWorkspaceDidActivateApplicationNotification, newApp);
     assert(atomic_load(&gObservedTargetPid) == 23015);
     assert(delegate.observerInstallCount == 3 && gBufferedTapToken == token);
-    [delegate stopTrackingWeChat];
+    TestRunningApplication *dock = [TestRunningApplication new];
+    dock.bundleIdentifier = @"com.apple.dock";
+    dock.processIdentifier = 568;
+    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, dock);
+    assert(atomic_load(&gDockPid) == 568);
+    assert(pidRequiresFirstClickBuffer(568));
+    assert(!pidRequiresFirstClickBuffer(569));
+    TestRunningApplication *newDock = [TestRunningApplication new];
+    newDock.bundleIdentifier = @"com.apple.dock";
+    newDock.processIdentifier = 570;
+    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, newDock);
+    notifyTestApplication(delegate, NSWorkspaceDidTerminateApplicationNotification, dock);
+    assert(atomic_load(&gDockPid) == 570);
+
+    [delegate stopTrackingTargets];
     assert(atomic_load(&gWeChatPid) == 0 && atomic_load(&gObservedTargetPid) == 0);
+    assert(atomic_load(&gDockPid) == 0);
     assert(gTargetObserverTap == NULL && gBufferedTapDown == NULL);
     notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, newApp);
     assert(atomic_load(&gWeChatPid) == 0);
@@ -530,7 +545,7 @@ static void testWeChatFirstTapBuffer(void) {
     atomic_store(&gWeChatPid, 23013);
     CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23013);
     atomic_store(&gInternalDraggingEnabled, true);
-    assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(!bufferSpecialTapButton(kCGEventLeftMouseDown, down));
     CFRelease(down); CFRelease(up); CFRelease(gSyntheticSource);
     gSyntheticSource = NULL;
     atomic_store(&gEnabled, false);
@@ -761,7 +776,7 @@ int main(void) {
     testOwnedReleaseOwnership();
     testStaleGenerationCannotReleaseNewDrag();
     testNativeEventPolicy();
-    testWeChatFirstTapBuffer();
+    testSpecialFirstTapBuffer();
     testSerializedDragTransaction();
     testDownstreamObserverDoesNotChangeOwnership();
     testDeviceSpecificDraggingPreferences();
