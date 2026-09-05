@@ -341,6 +341,41 @@ static void clearPostedEvents(void) {
     postedEventCount = 0;
 }
 
+@interface TestRunningApplication : NSObject
+@property(copy) NSString *bundleIdentifier;
+@property(assign) pid_t processIdentifier;
+@property(assign, getter=isTerminated) BOOL terminated;
+@end
+@implementation TestRunningApplication
+@end
+
+static void testPortCallback(CFMachPortRef port, void *message, CFIndex size, void *info) {
+    (void)port; (void)message; (void)size; (void)info;
+}
+
+@interface TestWeChatDelegate : AppDelegate
+@property(assign) int observerInstallCount;
+@property(assign) pid_t lastObserverPid;
+@property(assign) BOOL failObserver;
+@end
+@implementation TestWeChatDelegate
+- (void)installTargetObserverForPid:(pid_t)pid {
+    ++self.observerInstallCount;
+    self.lastObserverPid = pid;
+    if (self.failObserver) return;
+    // A local port exercises lifecycle cleanup without installing a desktop tap.
+    gTargetObserverTap = CFMachPortCreate(NULL, testPortCallback, NULL, NULL);
+    assert(gTargetObserverTap);
+    atomic_store(&gObservedTargetPid, pid);
+}
+@end
+
+static void notifyTestApplication(AppDelegate *delegate, NSString *name,
+                                  TestRunningApplication *app) {
+    [delegate weChatApplicationChanged:[NSNotification notificationWithName:name
+        object:nil userInfo:@{NSWorkspaceApplicationKey: app}]];
+}
+
 static void testWeChatFirstTapBuffer(void) {
     forceIdle();
     MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x7779;
@@ -419,6 +454,73 @@ static void testWeChatFirstTapBuffer(void) {
 
     CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 999);
     assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23013);
+    TestWeChatDelegate *delegate = [TestWeChatDelegate new];
+    delegate.trackingWeChat = YES;
+    TestRunningApplication *oldApp = [TestRunningApplication new];
+    oldApp.bundleIdentifier = @"com.tencent.xinWeChat";
+    oldApp.processIdentifier = 23013;
+    oldApp.terminated = YES;
+    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    token = gBufferedTapToken;
+    notifyTestApplication(delegate, NSWorkspaceDidTerminateApplicationNotification, oldApp);
+    assert(atomic_load(&gWeChatPid) == 0);
+    assert(gBufferedTapDown == NULL && gBufferedTapUp == NULL);
+    expireBufferedTap(token);
+    assert(postedEventCount == 0);
+    assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+
+    TestRunningApplication *newApp = [TestRunningApplication new];
+    newApp.bundleIdentifier = @"com.tencent.xinWeChat";
+    newApp.processIdentifier = 23014;
+    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, newApp);
+    assert(atomic_load(&gWeChatPid) == 23014);
+    assert(atomic_load(&gObservedTargetPid) == 23014);
+    assert(delegate.lastObserverPid == 23014 && delegate.observerInstallCount == 1);
+    assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23014);
+    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    token = gBufferedTapToken;
+    notifyTestApplication(delegate, NSWorkspaceDidActivateApplicationNotification, newApp);
+    notifyTestApplication(delegate, NSWorkspaceDidTerminateApplicationNotification, oldApp);
+    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, oldApp);
+    assert(gBufferedTapToken == token && gBufferedTapDown);
+    assert(atomic_load(&gWeChatPid) == 23014 && delegate.observerInstallCount == 1);
+
+    TestRunningApplication *otherApp = [TestRunningApplication new];
+    otherApp.bundleIdentifier = @"com.apple.finder";
+    otherApp.processIdentifier = 42;
+    notifyTestApplication(delegate, NSWorkspaceDidActivateApplicationNotification, otherApp);
+    assert(atomic_load(&gWeChatPid) == 23014 && gBufferedTapToken == token);
+
+    // A missed exit notification still requires clearing the old process's
+    // pending click, and observer failure must not disable the new PID filter.
+    newApp.processIdentifier = 23015;
+    delegate.failObserver = YES;
+    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, newApp);
+    assert(gBufferedTapDown == NULL && gTargetObserverTap == NULL);
+    assert(atomic_load(&gWeChatPid) == 23015 && atomic_load(&gObservedTargetPid) == 0);
+    expireBufferedTap(token);
+    assert(postedEventCount == 0);
+    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23015);
+    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    token = gBufferedTapToken;
+    delegate.failObserver = NO;
+    notifyTestApplication(delegate, NSWorkspaceDidActivateApplicationNotification, newApp);
+    assert(atomic_load(&gObservedTargetPid) == 23015);
+    assert(delegate.observerInstallCount == 3 && gBufferedTapToken == token);
+    [delegate stopTrackingWeChat];
+    assert(atomic_load(&gWeChatPid) == 0 && atomic_load(&gObservedTargetPid) == 0);
+    assert(gTargetObserverTap == NULL && gBufferedTapDown == NULL);
+    notifyTestApplication(delegate, NSWorkspaceDidLaunchApplicationNotification, newApp);
+    assert(atomic_load(&gWeChatPid) == 0);
+    expireBufferedTap(token);
+    assert(postedEventCount == 0);
+
+    atomic_store(&gWeChatPid, 23013);
     CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23013);
     atomic_store(&gInternalDraggingEnabled, true);
     assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));

@@ -31,7 +31,7 @@ TapDrag uses Apple's private `MultitouchSupport.framework` to observe raw trackp
 
 The first contact must be a short, stationary tap. The second contact must begin 30–160 ms after the first raw lift. Movement beyond 1.3 mm confirms the drag immediately; a stationary 180 ms hold can also confirm deliberate drag intent. Multi-finger contact invalidates the candidate.
 
-WeChat tap clicks have a roughly 200 ms decision window. Confirming a drag cancels the buffered first click; otherwise the click is replayed. Real double-clicks are replayed in order. Restart TapDrag after restarting WeChat so it can identify the new process.
+WeChat tap clicks have a roughly 200 ms decision window. Confirming a drag cancels the buffered first click; otherwise the click is replayed. Real double-clicks are replayed in order. TapDrag tracks WeChat launches and exits automatically, including when WeChat starts after TapDrag. Restarting WeChat does not require restarting TapDrag.
 
 On 2026-09-05, the user confirmed that double-tap text selection works with a physical trackpad in WeChat 4.1.11 on macOS 15.7.7. WeChat window dragging still requires separate confirmation. See the [diagnosis and validation record](docs/WECHAT-DRAG-DIAGNOSIS.md).
 

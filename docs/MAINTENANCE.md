@@ -112,7 +112,8 @@ raw contact 路径：gStateLock -> gChainLock
 - native dragging 配置
 - `input_event_tap` 和 `downstream_observer_active` 标明输入层级与观察器状态；`movement_input` 保留改写前事件，`observed_downstream` 记录下游观察，`delta_x/y` 保留移动增量。
 - schema 2 增加 `event_flags`、`button_number`、`mouse_subtype`、`hid_left_down`、`session_left_down`，并记录原生拖动作为对照。左键状态是回调时的采样值。
-- `target_observer_pid` 表示启动时绑定的微信进程，`observed_target_process` 为该进程路由点的只读观察。微信重启后需重启诊断版重新绑定；不做窗口移动特判。
+- `wechat_pid` 表示当前首击缓冲目标，`target_observer_pid` 表示当前只读观察器绑定的微信进程，二者在诊断摘要中分别报告。`observed_target_process` 为该进程路由点的只读观察；不做窗口移动特判。
+- 在主线程监听 NSWorkspace 的应用启动、退出和激活通知，按微信 Bundle ID 更新目标 PID。安装事件过滤器时先订阅通知再枚举现有进程，支持微信晚于 TapDrag 启动。PID 改变时丢弃旧点击缓冲、使旧超时任务失效并移除旧观察器；微信退出后不得向其他窗口补发旧点击。迟到的旧进程退出通知不得清除新 PID。观察器安装失败不影响首击缓冲，后续微信激活时重试；卸载过滤器时注销通知并清理目标。
 - 微信首击缓冲使用独立的 annotated-session 主动按钮过滤器，以此阶段的目标 PID 判定应用，避免 HID 阶段仍指向旧前台应用。raw 首击已结束且系统原生拖移关闭时，暂存首击 down/up；约 200 ms 内没有进入第二接触则补发，确认拖动后丢弃首击。单击补发后恢复当前指针位置；真正双击的按钮事件统一发布，避免第二次 down 越过首击补发。
 - 缓冲及补发与拖动共用 `gSyntheticLock`。该锁内允许取得 `gChainLock`，不得反向取 `gStateLock`。缓冲超时以 token 使旧回调失效；关闭功能、tap 失效时补发尚未提交的点击。`wechat_first_tap_buffer` 标识此路径；缓冲记录为 `native_event_filtered / first_tap`，确认拖动取消首击为 `native_event_filtered / second_tap`，补发为 `native_button_passed / first_tap`。
 
@@ -151,6 +152,7 @@ make verify
 10. 系统原生拖移开启时 TapDrag 明确显示为 inactive，且不合成事件。
 11. 关闭 `Enabled` 会安全结束当前状态，并停止处理新手势。
 12. 重建后签名 requirement 不变，不重复请求授权。
+13. 微信通过 Command+Q 退出再打开，或在 TapDrag 启动后才打开微信，双击文字拖选仍正常；无需重启 TapDrag。
 
 2026-09-05 验收记录：用户确认微信 4.1.11 / macOS 15.7.7 上的真实触控板双击文字拖选恢复正常；实际首击缓冲路径的输入框回放、`make verify` 和手动探针严格编译均通过。微信窗口拖动及普通单击、双击的实机回归尚未获得用户明确确认；自动化点击顺序测试通过不代表上述手工矩阵全部完成。根因、对照数据和复现命令见 [微信诊断记录](WECHAT-DRAG-DIAGNOSIS.md)。
 
