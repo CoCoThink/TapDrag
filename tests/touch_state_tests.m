@@ -43,6 +43,13 @@ static void testTouchCounting(void) {
     assert(touchingCount(NULL, 0) == 0);
 }
 
+static void testLoggingPolicy(void) {
+    assert(!loggingShouldRun(NO, NO));
+    assert(!loggingShouldRun(NO, YES));
+    assert(!loggingShouldRun(YES, NO));
+    assert(loggingShouldRun(YES, YES));
+}
+
 static void testIdentityBoundary(void) {
     DeviceState state = {0};
     state.identityValid = YES;
@@ -742,6 +749,7 @@ static void testDiagnosticRing(void) {
 
 int main(void) {
     testTouchCounting();
+    testLoggingPolicy();
     testIdentityBoundary();
     testContinuousIdentityTransfer();
     testMovementIncludesBreakFrame();

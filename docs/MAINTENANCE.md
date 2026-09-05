@@ -87,16 +87,22 @@ raw contact 路径：gStateLock -> gChainLock
 
 ## 7. Enabled 生命周期
 
-`gEnabled` 是唯一的产品开关，对应用户默认项 `DoubleTapDragReleaseEnabled`。关闭时必须：
+`gEnabled` 是拖动功能开关，对应用户默认项 `DoubleTapDragReleaseEnabled`。关闭时必须：
 
 1. 增加 `gFeatureEpoch`；
 2. 中断当前链；
 3. 重置所有设备状态；
-4. 停止自动日志。
+4. 停止当前自动日志会话，但不改变用户的自动日志偏好。
 
-开启时必须先确认权限并安装 event tap，再启动自动日志。不要再增加第二个“实验功能”开关。
+开启时必须先确认权限并安装 event tap；仅当 `AutomaticDiagnosticLoggingEnabled` 也为真时启动自动日志。不要再增加实验功能开关。
+
+### 登录启动
+
+菜单中的 `Launch at Login` 使用 macOS 13 起提供的 `SMAppService.mainAppService` 注册或注销主应用登录项。只在用户操作菜单时修改注册状态，不保存第二份布尔偏好；应用启动及每次打开菜单时读取系统状态。已启用显示勾选，待系统批准显示横线并提供设置入口，未注册或未找到显示未勾选；失败显示系统错误且刷新实际状态。该选项与拖动功能的 `Enabled` 独立，退出应用时不注销登录项。构建和包含 `main.m` 的测试程序均需链接 `ServiceManagement.framework`。接口说明见 [Apple SMAppService](https://developer.apple.com/documentation/servicemanagement/smappservice?language=objc)。
 
 ## 8. 诊断日志
+
+Diagnostics 子菜单中的 `Automatic Logging` 控制自动文件写入，默认开启并通过 `AutomaticDiagnosticLoggingEnabled` 持久化。它与拖动功能 `Enabled` 独立：关闭时先刷新当前日志并停止 timer，之后仍保留容量为 2048 的内存环形记录，供复制摘要和手动导出使用；再次开启且拖动功能正在运行时创建新的日志会话。菜单状态文案区分 `auto saved`、因拖动功能关闭而 `auto save paused`、关闭自动写入后的 `memory only` 和写入失败。关闭开关不删除已有日志文件。
 
 自动日志路径：
 
@@ -122,6 +128,8 @@ raw contact 路径：gStateLock -> gChainLock
 日志环形缓冲容量 2048，自动文件最多保留 12 个，目录权限 0700、文件权限 0600。若出现“偶发”问题，先用事件序列还原状态迁移，不要仅凭体感改阈值。
 
 ## 9. 签名与授权连续性
+
+构建脚本要求 `TAPDRAG_BUILD_CONFIGURATION` 为 `Release` 或 `Debug`，默认值是 `Release`。Release 使用 `-O2 -DNDEBUG`，Debug 使用 `-O0 -g -DDEBUG=1`；`make build`、`make verify`、`make run` 和发布打包均显式选择 Release，`make build-debug` 用于调试。生成包的 `Contents/Info.plist` 包含 `TapDragBuildConfiguration`，应在测试或分发前检查它，未知配置必须直接失败。
 
 应用对外名称和可执行文件已经改为 TapDrag，但 Bundle ID 与默认本地签名身份刻意保留旧值。macOS 权限依赖 designated requirement；保持 identifier 与证书私钥不变，可最大程度避免每次重建重新授权。
 
@@ -153,6 +161,8 @@ make verify
 11. 关闭 `Enabled` 会安全结束当前状态，并停止处理新手势。
 12. 重建后签名 requirement 不变，不重复请求授权。
 13. 微信通过 Command+Q 退出再打开，或在 TapDrag 启动后才打开微信，双击文字拖选仍正常；无需重启 TapDrag。
+14. `Launch at Login` 可启用和关闭；系统设置中修改登录项后，重新打开菜单能反映状态。需批准时显示设置入口。注销并重新登录后验证启动行为。
+15. `Automatic Logging` 关闭后不再更新磁盘日志，复制与导出仍包含内存记录；重新启动应用后保持选择。再次开启会创建新的自动日志文件。
 
 2026-09-05 验收记录：用户确认微信 4.1.11 / macOS 15.7.7 上的真实触控板双击文字拖选恢复正常；实际首击缓冲路径的输入框回放、`make verify` 和手动探针严格编译均通过。微信窗口拖动及普通单击、双击的实机回归尚未获得用户明确确认；自动化点击顺序测试通过不代表上述手工矩阵全部完成。根因、对照数据和复现命令见 [微信诊断记录](WECHAT-DRAG-DIAGNOSIS.md)。
 

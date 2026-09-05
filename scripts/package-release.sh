@@ -12,6 +12,7 @@ ZIP_PATH="$DIST_DIR/$ZIP_NAME"
 # A local self-signed development identity is intentionally never inherited by
 # release packaging. Set this to a Developer ID identity when preparing an
 # independently distributed build.
+TAPDRAG_BUILD_CONFIGURATION=Release \
 TAPDRAG_CODESIGN_IDENTITY="${TAPDRAG_RELEASE_CODESIGN_IDENTITY:--}" \
     "$ROOT_DIR/TapDrag/build.sh" >/dev/null
 

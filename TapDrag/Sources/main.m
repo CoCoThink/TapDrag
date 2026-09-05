@@ -1,6 +1,7 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <ServiceManagement/ServiceManagement.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <dispatch/dispatch.h>
 #import <dlfcn.h>
@@ -213,6 +214,7 @@ static DiagnosticRecord gRecords[DiagnosticCapacity];
 static uint64_t gRecordSequence = 0;
 static atomic_uint gDroppedRecords = 0;
 static atomic_bool gLoggingActive = false;
+static atomic_bool gAutomaticLoggingEnabled = true;
 static atomic_bool gLoggingDirty = false;
 static atomic_bool gLoggingFaulted = false;
 static dispatch_queue_t gLoggingQueue = NULL;
@@ -220,6 +222,7 @@ static dispatch_source_t gLoggingTimer = NULL;
 static NSURL *gAutomaticLogURL = nil;
 
 static NSString *const EnabledKey = @"DoubleTapDragReleaseEnabled";
+static NSString *const AutomaticLoggingKey = @"AutomaticDiagnosticLoggingEnabled";
 static const int64_t DoubleTapTag = 0x3346444E45574452LL;
 static const long long MinimumSecondContactGapMillis = 30;
 static const long long MaximumSecondTapGapMillis = 160;
@@ -577,6 +580,10 @@ static void stopLogging(void) {
     if (gLoggingQueue != NULL) dispatch_sync(gLoggingQueue, ^{ persistTrace(); });
     atomic_store(&gLoggingActive, false);
     if (gLoggingTimer != NULL) { dispatch_source_cancel(gLoggingTimer); gLoggingTimer = NULL; }
+}
+
+static BOOL loggingShouldRun(BOOL featureEnabled, BOOL automaticLoggingEnabled) {
+    return featureEnabled && automaticLoggingEnabled;
 }
 
 static BOOL readDraggingPreference(NSString *domain, BOOL *present) {
@@ -1352,7 +1359,9 @@ static CGEventMask diagnosticMouseMask(void) {
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property(strong) NSStatusItem *statusItem;
 @property(strong) NSMenuItem *enabledItem;
+@property(strong) NSMenuItem *launchAtLoginItem, *loginApprovalItem;
 @property(strong) NSMenuItem *replacementStatus, *runtimeStatus, *diagnosticStatus, *accessibilityItem;
+@property(strong) NSMenuItem *automaticLoggingItem;
 @property(assign) CFArrayRef deviceList;
 @property(assign) void *multitouchHandle;
 @property(assign) BOOL trackingWeChat;
@@ -1502,7 +1511,47 @@ static CGEventMask diagnosticMouseMask(void) {
     if (gEventTap) { CFMachPortInvalidate(gEventTap); CFRelease(gEventTap); gEventTap = NULL; }
 }
 
+- (void)updateLaunchAtLoginStatus {
+    SMAppServiceStatus status = SMAppService.mainAppService.status;
+    switch (status) {
+        case SMAppServiceStatusEnabled:
+            self.launchAtLoginItem.state = NSControlStateValueOn; break;
+        case SMAppServiceStatusRequiresApproval:
+            self.launchAtLoginItem.state = NSControlStateValueMixed; break;
+        case SMAppServiceStatusNotRegistered:
+        case SMAppServiceStatusNotFound:
+            self.launchAtLoginItem.state = NSControlStateValueOff; break;
+    }
+    self.loginApprovalItem.hidden = status != SMAppServiceStatusRequiresApproval;
+}
+
+- (void)openLoginItemsSettings:(id)sender {
+    (void)sender; [SMAppService openSystemSettingsLoginItems];
+}
+
+- (void)toggleLaunchAtLogin:(id)sender {
+    (void)sender;
+    SMAppService *service = SMAppService.mainAppService;
+    SMAppServiceStatus status = service.status;
+    BOOL disable = status == SMAppServiceStatusEnabled || status == SMAppServiceStatusRequiresApproval;
+    NSError *error = nil;
+    BOOL success = disable ? [service unregisterAndReturnError:&error]
+                           : [service registerAndReturnError:&error];
+    [self updateLaunchAtLoginStatus];
+    if (!disable && service.status == SMAppServiceStatusRequiresApproval) {
+        [self openLoginItemsSettings:nil];
+    } else if (!success) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Launch at Login Could Not Be Updated";
+        alert.informativeText = error.localizedDescription ?: @"macOS could not update the login item. Please try again.";
+        [alert addButtonWithTitle:@"OK"];
+        [alert addButtonWithTitle:@"Open Login Items Settings"];
+        if ([alert runModal] == NSAlertSecondButtonReturn) [self openLoginItemsSettings:nil];
+    }
+}
+
 - (void)updateStatus {
+    [self updateLaunchAtLoginStatus];
     if (self.replacementStatus) {
         self.replacementStatus.title = !atomic_load(&gEnabled)
             ? @"TapDrag: Disabled"
@@ -1527,8 +1576,12 @@ static CGEventMask diagnosticMouseMask(void) {
     }
     if (self.diagnosticStatus) {
         os_unfair_lock_lock(&gDiagnosticLock); uint64_t count = MIN(gRecordSequence, (uint64_t)DiagnosticCapacity); os_unfair_lock_unlock(&gDiagnosticLock);
-        self.diagnosticStatus.title = [NSString stringWithFormat:@"Diagnostics: %llu events%@", count,
-            atomic_load(&gLoggingFaulted) ? @", write failed" : (atomic_load(&gLoggingActive) ? @", auto saved" : @"")];
+        NSString *loggingStatus = atomic_load(&gLoggingFaulted) ? @", write failed"
+            : (atomic_load(&gLoggingActive) ? @", auto saved"
+                : (atomic_load(&gAutomaticLoggingEnabled) ? @", auto save paused" : @", memory only"));
+        self.diagnosticStatus.title = [NSString stringWithFormat:@"Diagnostics: %llu events%@", count, loggingStatus];
+        self.automaticLoggingItem.state = atomic_load(&gAutomaticLoggingEnabled)
+            ? NSControlStateValueOn : NSControlStateValueOff;
     }
 }
 
@@ -1546,10 +1599,14 @@ static CGEventMask diagnosticMouseMask(void) {
     self.statusItem.button.toolTip = @"TapDrag";
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@""]; menu.delegate = self;
     self.enabledItem = [self item:@"Enabled" action:@selector(toggleEnabled:) menu:menu]; self.enabledItem.state = atomic_load(&gEnabled);
+    self.launchAtLoginItem = [self item:@"Launch at Login" action:@selector(toggleLaunchAtLogin:) menu:menu];
+    self.loginApprovalItem = [self item:@"Approve Launch at Login..." action:@selector(openLoginItemsSettings:) menu:menu];
+    self.loginApprovalItem.hidden = YES;
     self.replacementStatus = [self item:@"TapDrag: checking" action:nil menu:menu]; self.replacementStatus.enabled = NO;
     self.runtimeStatus = [self item:@"Last gesture: waiting" action:nil menu:menu]; self.runtimeStatus.enabled = NO;
     NSMenuItem *root = [[NSMenuItem alloc] initWithTitle:@"Diagnostics" action:nil keyEquivalent:@""];
     NSMenu *diagnostics = [[NSMenu alloc] initWithTitle:@"Diagnostics"];
+    self.automaticLoggingItem = [self item:@"Automatic Logging" action:@selector(toggleAutomaticLogging:) menu:diagnostics];
     self.diagnosticStatus = [self item:@"Diagnostics: 0 events" action:nil menu:diagnostics]; self.diagnosticStatus.enabled = NO;
     [diagnostics addItem:[NSMenuItem separatorItem]];
     [self item:@"Copy Diagnostic Summary" action:@selector(copyDiagnostics:) menu:diagnostics];
@@ -1572,9 +1629,21 @@ static CGEventMask diagnosticMouseMask(void) {
         if ([alert runModal] == NSAlertFirstButtonReturn) [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]]; return;
     }
     atomic_store(&gEnabled, enable);
-    if (enable) startLogging(); else { atomic_fetch_add(&gFeatureEpoch, 1); interruptChain(ReasonDisabled); os_unfair_lock_lock(&gStateLock); resetAllDevicesLocked(); os_unfair_lock_unlock(&gStateLock); stopLogging(); }
+    if (loggingShouldRun(enable, atomic_load(&gAutomaticLoggingEnabled))) startLogging();
+    else stopLogging();
+    if (!enable) { atomic_fetch_add(&gFeatureEpoch, 1); interruptChain(ReasonDisabled); os_unfair_lock_lock(&gStateLock); resetAllDevicesLocked(); os_unfair_lock_unlock(&gStateLock); }
     [[NSUserDefaults standardUserDefaults] setBool:enable forKey:EnabledKey]; self.enabledItem.state = enable;
     atomic_store(&gLastOutcome, atomic_load(&gAnyNativeDraggingEnabled) ? ReleaseOutcomeNativeDraggingOn : ReleaseOutcomeWaiting); [self updateStatus];
+}
+
+- (void)toggleAutomaticLogging:(id)sender {
+    (void)sender;
+    BOOL enabled = !atomic_load(&gAutomaticLoggingEnabled);
+    atomic_store(&gAutomaticLoggingEnabled, enabled);
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:AutomaticLoggingKey];
+    if (loggingShouldRun(atomic_load(&gEnabled), enabled)) startLogging();
+    else stopLogging();
+    [self updateStatus];
 }
 
 - (void)requestAccessibility:(id)sender { (void)sender; AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES}); }
@@ -1582,7 +1651,7 @@ static CGEventMask diagnosticMouseMask(void) {
 - (void)exportDiagnostics:(id)sender { (void)sender; NSSavePanel *p = NSSavePanel.savePanel; p.nameFieldStringValue = @"TapDrag-diagnostics.jsonl"; UTType *type = [UTType typeWithFilenameExtension:@"jsonl"]; if (type) p.allowedContentTypes = @[type]; if ([p runModal] == NSModalResponseOK && p.URL) [traceText(@"manual_export") writeToURL:p.URL atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
 - (void)revealDiagnostics:(id)sender { (void)sender; NSURL *url = gAutomaticLogURL ? gAutomaticLogURL.URLByDeletingLastPathComponent : logDirectoryURL(); [[NSFileManager defaultManager] createDirectoryAtURL:url withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@(0700)} error:nil]; [[NSWorkspace sharedWorkspace] openURL:url]; }
 - (void)clearDiagnostics:(id)sender { (void)sender; clearRecords(); [self updateStatus]; }
-- (void)hideStatusItem:(id)sender { (void)sender; if (!self.statusItem) return; [[NSStatusBar systemStatusBar] removeStatusItem:self.statusItem]; self.statusItem = nil; self.enabledItem = nil; self.replacementStatus = self.runtimeStatus = self.diagnosticStatus = self.accessibilityItem = nil; }
+- (void)hideStatusItem:(id)sender { (void)sender; if (!self.statusItem) return; [[NSStatusBar systemStatusBar] removeStatusItem:self.statusItem]; self.statusItem = nil; self.enabledItem = nil; self.launchAtLoginItem = self.loginApprovalItem = self.automaticLoggingItem = nil; self.replacementStatus = self.runtimeStatus = self.diagnosticStatus = self.accessibilityItem = nil; }
 
 - (void)menuWillOpen:(NSMenu *)menu {
     if (menu != self.statusItem.menu) return; BOOL old = atomic_load(&gAnyNativeDraggingEnabled); refreshDraggingPreferences();
@@ -1610,10 +1679,11 @@ static CGEventMask diagnosticMouseMask(void) {
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    (void)notification; [[NSUserDefaults standardUserDefaults] registerDefaults:@{EnabledKey:@YES}];
+    (void)notification; [[NSUserDefaults standardUserDefaults] registerDefaults:@{EnabledKey:@YES, AutomaticLoggingKey:@YES}];
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    atomic_store(&gAutomaticLoggingEnabled, [d boolForKey:AutomaticLoggingKey]);
     gNextEventNumber = SyntheticEventNumberMinimum + arc4random_uniform(SyntheticEventNumberMaximum); gSyntheticSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState); if (gSyntheticSource) CGEventSourceSetLocalEventsSuppressionInterval(gSyntheticSource, 0);
-    refreshDraggingPreferences(); if ([d boolForKey:EnabledKey] && [self accessStatus:NO] == AccessGranted && [self installEventTap]) { atomic_store(&gEnabled, true); startLogging(); }
+    refreshDraggingPreferences(); if ([d boolForKey:EnabledKey] && [self accessStatus:NO] == AccessGranted && [self installEventTap]) { atomic_store(&gEnabled, true); if (atomic_load(&gAutomaticLoggingEnabled)) startLogging(); }
     [self setupStatusItem]; [self startMultitouch];
 }
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag { (void)sender; (void)flag; [self setupStatusItem]; return NO; }

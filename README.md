@@ -29,6 +29,8 @@ TapDrag uses Apple's private `MultitouchSupport.framework` to observe raw trackp
 4. Confirm the status reads `TapDrag: Ready`.
 5. Tap once, place the finger down again quickly, then move it to drag. Lift the finger to release immediately.
 
+Check `Launch at Login` in the menu to start TapDrag automatically when you log in to macOS; uncheck it to disable automatic startup. The menu reflects the current system setting each time it opens. A dash means macOS approval is pending; use `Approve Launch at Login...` to open Login Items settings. This setting is independent of `Enabled`.
+
 The first contact must be a short, stationary tap. The second contact must begin 30–160 ms after the first raw lift. Movement beyond 1.3 mm confirms the drag immediately; a stationary 180 ms hold can also confirm deliberate drag intent. Multi-finger contact invalidates the candidate.
 
 WeChat tap clicks have a roughly 200 ms decision window. Confirming a drag cancels the buffered first click; otherwise the click is replayed. Real double-clicks are replayed in order. TapDrag tracks WeChat launches and exits automatically, including when WeChat starts after TapDrag. Restarting WeChat does not require restarting TapDrag.
@@ -43,12 +45,16 @@ make verify
 make run
 ```
 
+`make build`, `make verify`, and `make run` explicitly use the Release configuration (`-O2 -DNDEBUG`). Use `make build-debug` for an unoptimized build with debug information (`-O0 -g -DDEBUG=1`). The generated app records its configuration as `TapDragBuildConfiguration` in `Contents/Info.plist`; unsupported configuration names fail the build.
+
 `make setup-local-signing` is normally required only once. For authorization continuity, the project deliberately retains the existing bundle identifier and default local signing identity from earlier builds. Changing either can make macOS request Accessibility and Input Monitoring permission again.
 
 Useful targets:
 
 ```sh
 make build
+make build-release
+make build-debug
 make build-adhoc
 make test
 make verify
@@ -66,7 +72,7 @@ While TapDrag is enabled, automatic JSONL traces are stored in:
 ~/Library/Logs/TapDrag/Diagnostics/
 ```
 
-The menu also supports copying a diagnostic summary, exporting a trace, revealing automatic logs, and clearing the in-memory trace. Automatic logs are limited to the newest 12 sessions and use owner-only permissions.
+The Diagnostics submenu includes an `Automatic Logging` switch. Turning it off stops creating and updating automatic log files while retaining the bounded in-memory trace for manual copy or export. The setting persists across launches and is independent of `Enabled`. Automatic logs are limited to the newest 12 sessions and use owner-only permissions.
 
 ## Project layout
 

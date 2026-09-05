@@ -186,7 +186,7 @@
 复现实验（会向已确认的测试输入框发送鼠标事件，不属于无副作用单元测试）：
 
 ```sh
-clang -fobjc-arc -Wall -Wextra -Wswitch-enum -Werror tests/manual_wechat_probe.m -o build/tests/manual_wechat_probe -framework AppKit -framework ApplicationServices -framework UniformTypeIdentifiers
+clang -fobjc-arc -Wall -Wextra -Wswitch-enum -Werror tests/manual_wechat_probe.m -o build/tests/manual_wechat_probe -framework AppKit -framework ApplicationServices -framework ServiceManagement -framework UniformTypeIdentifiers
 build/tests/manual_wechat_probe single-hid
 build/tests/manual_wechat_probe double-hid 1 120
 build/tests/manual_wechat_probe double-hid 1 1100
