@@ -15,6 +15,7 @@ TapDrag 只负责一件事：在 macOS 原生触控板拖移关闭时，实现�
 | `TapDrag/Resources/AppIcon.png` | 应用图标源文件。 |
 | `TapDrag/build.sh` | 编译、组装、签名和签名验证。 |
 | `tests/touch_state_tests.m` | 状态机与手势边界回归测试。 |
+| `tests/manual_wechat_probe.m` | 微信测试草稿上的手动集成回放，会发送鼠标事件。 |
 | `scripts/generate-app-icon.m` | 可复现生成图标源文件。 |
 | `scripts/create-local-signing-identity.sh` | 一次性创建稳定的本地签名身份。 |
 | `scripts/signing-status.sh` | 检查签名身份和 designated requirement。 |
@@ -31,10 +32,12 @@ TapDrag 只负责一件事：在 macOS 原生触控板拖移关闭时，实现�
 
 ## 4. 输入与输出
 
-输入有两条：
+输入处理包括：
 
 - `MultitouchSupport.framework` 的 raw contact frame，决定真实接触开始、移动、身份变化和抬起。
-- session event tap 的鼠标事件，保留第一次正常点击，并在应用拥有拖动事务后过滤冲突事件。
+- HID event tap 的鼠标事件，在应用拥有拖动事务后过滤冲突事件。拥有事务时消费原生 movement，将替代拖动与 down/up 在同一锁保护下从 HID 发布。
+- annotated-session 主动按钮过滤器仅对微信暂存 raw 首击；确认拖动时取消首击，否则补发普通点击。其他应用的首击正常放行。
+- annotated-session 层的只读观察器仅记录下游事件，不参与拖动状态迁移；观察器失效不能中断拖动。
 
 输出是一条带 `DoubleTapTag` 的完整事务：
 
@@ -49,7 +52,7 @@ leftMouseDown -> leftMouseDragged* -> leftMouseUp
 - 第一次接触必须在 250 ms 内结束，且移动不超过阈值。
 - 第二次接触与第一次 raw lift 的间隔必须在 30–160 ms 内，同时受更短的系统双击间隔约束。
 - 第二次接触移动超过 1.3 mm 时立即确认拖动。物理毫米坐标有效时只使用该阈值；归一化坐标仅在物理坐标无效时作为备用。
-- TapDrag 作为解释 raw 触控板状态并生成鼠标事务的用户态输入工具，synthetic down/up 必须使用 `kCGEventSourceStateHIDSystemState`。通常路径在 `Owned` 阶段把原生 movement 原地改成带 TapDrag event number 的 `leftMouseDragged`；不要重写 source PID/UID/GID，也不要把 WindowServer 的 `target/window` 注释当作可靠路由。
+- TapDrag 作为解释 raw 触控板状态并生成鼠标事务的用户态输入工具，synthetic down/drag/up 必须使用 `kCGEventSourceStateHIDSystemState`。在 `Owned` 阶段消费原生 movement 并创建带本事务 event number 的 `leftMouseDragged`，保留坐标、delta 和修饰键，使用当前单调时间戳与本工具真实来源身份；不要伪造 source PID/UID/GID，也不要把 WindowServer 的 `target/window` 注释当作可靠路由。禁止原地返回修改后的原生 movement：实测该路径可越过异步发布的 down。
 - 第二次接触保持 180 ms 也可确认拖动意图。
 - 任意多指接触使候选失效。
 - 物理按压产生的 native mouse-down 若发生在第一次接触尚未结束时，不得成为首击候选。
@@ -107,6 +110,13 @@ raw contact 路径：gStateLock -> gChainLock
 - raw contact 数量、frame 数、接触时长、间隔和毫米移动距离
 - native/synthetic 事件类型、event number、click state、source state、来源 PID/UID/GID、观察到的目标 PID 与窗口 ID
 - native dragging 配置
+- `input_event_tap` 和 `downstream_observer_active` 标明输入层级与观察器状态；`movement_input` 保留改写前事件，`observed_downstream` 记录下游观察，`delta_x/y` 保留移动增量。
+- schema 2 增加 `event_flags`、`button_number`、`mouse_subtype`、`hid_left_down`、`session_left_down`，并记录原生拖动作为对照。左键状态是回调时的采样值。
+- `target_observer_pid` 表示启动时绑定的微信进程，`observed_target_process` 为该进程路由点的只读观察。微信重启后需重启诊断版重新绑定；不做窗口移动特判。
+- 微信首击缓冲使用独立的 annotated-session 主动按钮过滤器，以此阶段的目标 PID 判定应用，避免 HID 阶段仍指向旧前台应用。raw 首击已结束且系统原生拖移关闭时，暂存首击 down/up；约 200 ms 内没有进入第二接触则补发，确认拖动后丢弃首击。单击补发后恢复当前指针位置；真正双击的按钮事件统一发布，避免第二次 down 越过首击补发。
+- 缓冲及补发与拖动共用 `gSyntheticLock`。该锁内允许取得 `gChainLock`，不得反向取 `gStateLock`。缓冲超时以 token 使旧回调失效；关闭功能、tap 失效时补发尚未提交的点击。`wechat_first_tap_buffer` 标识此路径；缓冲记录为 `native_event_filtered / first_tap`，确认拖动取消首击为 `native_event_filtered / second_tap`，补发为 `native_button_passed / first_tap`。
+
+`synthetic_down/drag/up` 仍表示发布或改写，不是应用接收回执。释放后观察到的事件可能以 generation 0 记录，需用本会话中的 tag、event number 和时间顺序关联；下游观察也不能证明窗口已经移动。
 
 日志环形缓冲容量 2048，自动文件最多保留 12 个，目录权限 0700、文件权限 0600。若出现“偶发”问题，先用事件序列还原状态迁移，不要仅凭体感改阈值。
 
@@ -141,5 +151,7 @@ make verify
 10. 系统原生拖移开启时 TapDrag 明确显示为 inactive，且不合成事件。
 11. 关闭 `Enabled` 会安全结束当前状态，并停止处理新手势。
 12. 重建后签名 requirement 不变，不重复请求授权。
+
+2026-09-05 验收记录：用户确认微信 4.1.11 / macOS 15.7.7 上的真实触控板双击文字拖选恢复正常；实际首击缓冲路径的输入框回放、`make verify` 和手动探针严格编译均通过。微信窗口拖动及普通单击、双击的实机回归尚未获得用户明确确认；自动化点击顺序测试通过不代表上述手工矩阵全部完成。根因、对照数据和复现命令见 [微信诊断记录](WECHAT-DRAG-DIAGNOSIS.md)。
 
 若改动图标，编译并运行 `scripts/generate-app-icon.m` 生成 1024×1024 PNG，再执行完整构建确认 Finder 和菜单栏显示正常。

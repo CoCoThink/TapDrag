@@ -6,10 +6,11 @@ TapDrag is a lightweight macOS menu bar utility that provides double-tap draggin
 
 - Recognizes a short tap followed by a second one-finger contact.
 - Starts dragging only after the second contact moves far enough or is deliberately held.
-- Preserves the normal first tap for selection and background-window activation.
+- Preserves normal clicks. In WeChat, the first tap is briefly buffered so a drag does not become a double-click.
 - Sends one complete tagged `mouseDown -> mouseDragged -> mouseUp` transaction.
 - Releases immediately on the real raw finger lift.
 - Keeps a bounded automatic diagnostic trace for difficult gesture failures.
+- Handles drag input at the HID stage and observes downstream events for compatibility diagnostics.
 
 ## Requirements
 
@@ -29,6 +30,10 @@ TapDrag uses Apple's private `MultitouchSupport.framework` to observe raw trackp
 5. Tap once, place the finger down again quickly, then move it to drag. Lift the finger to release immediately.
 
 The first contact must be a short, stationary tap. The second contact must begin 30–160 ms after the first raw lift. Movement beyond 1.3 mm confirms the drag immediately; a stationary 180 ms hold can also confirm deliberate drag intent. Multi-finger contact invalidates the candidate.
+
+WeChat tap clicks have a roughly 200 ms decision window. Confirming a drag cancels the buffered first click; otherwise the click is replayed. Real double-clicks are replayed in order. Restart TapDrag after restarting WeChat so it can identify the new process.
+
+On 2026-09-05, the user confirmed that double-tap text selection works with a physical trackpad in WeChat 4.1.11 on macOS 15.7.7. WeChat window dragging still requires separate confirmation. See the [diagnosis and validation record](docs/WECHAT-DRAG-DIAGNOSIS.md).
 
 ## Build
 

@@ -9,6 +9,7 @@
 #import <os/lock.h>
 #import <stdatomic.h>
 #import <stdint.h>
+#import <time.h>
 #import <unistd.h>
 
 typedef void *MTDeviceRef;
@@ -74,6 +75,9 @@ typedef enum {
     DiagnosticNativeObserved,
     DiagnosticNativePassed,
     DiagnosticNativeFiltered,
+    DiagnosticMovementInput,
+    DiagnosticDownstreamObserved,
+    DiagnosticTargetObserved,
     DiagnosticReset,
     DiagnosticConfiguration,
     DiagnosticFailure,
@@ -99,6 +103,9 @@ typedef enum {
     ReasonIntertapTooShort,
     ReasonIntertapExpired,
     ReasonIdentityTransfer,
+    ReasonObserverUnavailable,
+    ReasonObserverDisabled,
+    ReasonTargetObserverUnavailable,
 } DiagnosticReason;
 
 typedef enum { NativePass, NativeFilter, NativeReplaceDrag } NativeDisposition;
@@ -144,6 +151,9 @@ typedef struct {
 typedef struct {
     uint64_t sequence, machTime, generation, eventTimestamp;
     int64_t wallMillis, eventNumber, sourceUserData;
+    int64_t deltaX, deltaY;
+    uint64_t eventFlags;
+    int32_t buttonNumber, mouseSubtype, hidLeftDown, sessionLeftDown;
     int32_t phase, kind, reason, eventType, clickState;
     int32_t sourceState, sourcePid, sourceUid, sourceGid;
     int32_t targetPid, targetWindow, handlingWindow, x, y;
@@ -182,6 +192,21 @@ static uint64_t gNextEventNumber = SyntheticEventNumberMinimum;
 static CGEventSourceRef gSyntheticSource = NULL;
 static CFMachPortRef gEventTap = NULL;
 static CFRunLoopSourceRef gEventTapSource = NULL;
+static CFMachPortRef gClickTap = NULL;
+static CFRunLoopSourceRef gClickTapSource = NULL;
+static CFMachPortRef gObserverTap = NULL;
+static CFRunLoopSourceRef gObserverTapSource = NULL;
+static atomic_bool gObserverActive = false;
+static CFMachPortRef gTargetObserverTap = NULL;
+static CFRunLoopSourceRef gTargetObserverTapSource = NULL;
+static atomic_int gObservedTargetPid = 0;
+static atomic_int gWeChatPid = 0;
+// Protected by gSyntheticLock; native first clicks must not precede a
+// replacement drag in applications that recognize double-clicks themselves.
+static CGEventRef gBufferedTapDown = NULL, gBufferedTapUp = NULL;
+static MTDeviceRef gBufferedTapDevice = NULL;
+static unsigned long long gBufferedTapToken = 0;
+static int64_t gReplayedButtonNumber = 0;
 static MTDeviceIsBuiltInFunction gDeviceIsBuiltIn = NULL;
 
 static DiagnosticRecord gRecords[DiagnosticCapacity];
@@ -203,6 +228,7 @@ static const double MaximumFirstTapDurationSeconds = 0.25;
 static const float TapMoveThresholdMillimeters = 1.3f;
 static const float FallbackNormalizedMoveThreshold = 0.010f;
 static const long long FirstClickAllowanceMillis = 40;
+static const CGEventTapLocation InputTapLocation = kCGHIDEventTap;
 
 static long long nowMillis(void) {
     return (long long)(CFAbsoluteTimeGetCurrent() * 1000.0);
@@ -219,6 +245,7 @@ static long long doubleTapDragGapForSystemMillis(long long systemInterval) {
 static long long doubleTapDragGapMillis(void) {
     return doubleTapDragGapForSystemMillis(doubleClickIntervalMillis());
 }
+
 
 static BOOL secondContactGapIsValid(long long gap, long long maximumGap) {
     return gap >= MinimumSecondContactGapMillis && gap <= maximumGap;
@@ -264,6 +291,10 @@ static CGEventRef createTaggedEvent(CGEventType type, CGPoint location, int64_t 
     CGEventSetIntegerValueField(event, kCGEventSourceGroupID, getegid());
     CGEventSetIntegerValueField(event, kCGMouseEventClickState, 1);
     CGEventSetIntegerValueField(event, kCGMouseEventNumber, number);
+    // This transaction is driven by raw trackpad contacts. Keep its device
+    // subtype consistent with the native first tap and movement events.
+    CGEventSetIntegerValueField(event, kCGMouseEventSubtype, NSEventSubtypeTouch);
+    CGEventSetTimestamp(event, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     return event;
 }
 
@@ -296,6 +327,9 @@ static NSString *kindName(DiagnosticKind kind) {
         case DiagnosticNativeObserved: return @"native_button_observed";
         case DiagnosticNativePassed: return @"native_button_passed";
         case DiagnosticNativeFiltered: return @"native_event_filtered";
+        case DiagnosticMovementInput: return @"movement_input";
+        case DiagnosticDownstreamObserved: return @"observed_downstream";
+        case DiagnosticTargetObserved: return @"observed_target_process";
         case DiagnosticReset: return @"chain_reset";
         case DiagnosticConfiguration: return @"configuration";
         case DiagnosticFailure: return @"failure";
@@ -324,6 +358,9 @@ static NSString *reasonName(DiagnosticReason reason) {
         case ReasonIntertapTooShort: return @"intertap_too_short";
         case ReasonIntertapExpired: return @"intertap_expired";
         case ReasonIdentityTransfer: return @"identity_transfer";
+        case ReasonObserverUnavailable: return @"observer_unavailable";
+        case ReasonObserverDisabled: return @"observer_disabled";
+        case ReasonTargetObserverUnavailable: return @"target_observer_unavailable";
     }
     return @"unknown";
 }
@@ -345,6 +382,13 @@ static void recordDiagnosticDetails(DiagnosticKind kind, DiagnosticReason reason
         .eventType = event == NULL ? kCGEventNull : (int32_t)CGEventGetType(event),
         .clickState = event == NULL ? 0 : (int32_t)CGEventGetIntegerValueField(event, kCGMouseEventClickState),
         .eventNumber = event == NULL ? 0 : CGEventGetIntegerValueField(event, kCGMouseEventNumber),
+        .deltaX = event == NULL ? 0 : CGEventGetIntegerValueField(event, kCGMouseEventDeltaX),
+        .deltaY = event == NULL ? 0 : CGEventGetIntegerValueField(event, kCGMouseEventDeltaY),
+        .eventFlags = event == NULL ? 0 : CGEventGetFlags(event),
+        .buttonNumber = event == NULL ? -1 : (int32_t)CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber),
+        .mouseSubtype = event == NULL ? -1 : (int32_t)CGEventGetIntegerValueField(event, kCGMouseEventSubtype),
+        .hidLeftDown = event == NULL ? -1 : CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonLeft),
+        .sessionLeftDown = event == NULL ? -1 : CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft),
         .targetPid = event == NULL ? 0 : (int32_t)CGEventGetIntegerValueField(
             event, kCGEventTargetUnixProcessID),
         .sourceState = event == NULL ? 0 : (int32_t)CGEventGetIntegerValueField(
@@ -413,6 +457,10 @@ static NSDictionary *recordDictionary(DiagnosticRecord r) {
              @"reason": reasonName((DiagnosticReason)r.reason),
              @"event_type": @(r.eventType), @"click_state": @(r.clickState),
              @"mouse_event_number": @(r.eventNumber),
+             @"delta_x": @(r.deltaX), @"delta_y": @(r.deltaY),
+             @"event_flags": @(r.eventFlags), @"button_number": @(r.buttonNumber),
+             @"mouse_subtype": @(r.mouseSubtype),
+             @"hid_left_down": @(r.hidLeftDown), @"session_left_down": @(r.sessionLeftDown),
              @"source_state_id": @(r.sourceState),
              @"source_pid": @(r.sourcePid),
              @"source_uid": @(r.sourceUid),
@@ -443,6 +491,13 @@ static NSString *traceText(NSString *capture) {
         @"version": [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"unknown",
         @"build": [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"unknown",
         @"records": @(count), @"dropped": @(dropped),
+        @"input_event_tap": @"hid",
+        @"drag_delivery": @"serialized_hid_post",
+        @"synthetic_mouse_subtype": @(NSEventSubtypeTouch),
+        @"wechat_first_tap_buffer": @YES,
+        @"downstream_observer_active": @(atomic_load(&gObserverActive)),
+        @"target_observer_pid": @(atomic_load(&gObservedTargetPid)),
+        @"diagnostic_schema": @3,
         @"system_double_click_ms": @(doubleClickIntervalMillis()),
         @"minimum_second_contact_gap_ms": @(MinimumSecondContactGapMillis),
         @"double_tap_drag_gap_ms": @(doubleTapDragGapMillis()),
@@ -795,7 +850,7 @@ static BOOL postUp(int64_t number, CGPoint location, unsigned long long generati
     if (up != NULL) {
         recordDiagnostic(DiagnosticSyntheticUp, ReasonLift, generation,
             DragPhaseReleasing, up, location, 0, 0, 0, YES, NO);
-        CGEventPost(kCGHIDEventTap, up); CFRelease(up);
+        CGEventPost(InputTapLocation, up); CFRelease(up);
     }
     os_unfair_lock_unlock(&gSyntheticLock); return up != NULL;
 }
@@ -803,6 +858,107 @@ static BOOL postUp(int64_t number, CGPoint location, unsigned long long generati
 static BOOL locationsDiffer(CGPoint a, CGPoint b) {
     return fabs(a.x - b.x) >= 0.5 || fabs(a.y - b.y) >= 0.5;
 }
+
+static void discardBufferedTapLocked(void) {
+    if (gBufferedTapDown) CFRelease(gBufferedTapDown);
+    if (gBufferedTapUp) CFRelease(gBufferedTapUp);
+    gBufferedTapDown = gBufferedTapUp = NULL;
+    gBufferedTapDevice = NULL;
+    ++gBufferedTapToken;
+}
+
+static void postBufferedButtonLocked(CGEventRef original) {
+    CGEventRef event = CGEventCreateCopy(original);
+    if (!event) return;
+    CGEventSetSource(event, gSyntheticSource);
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData, DoubleTapTag);
+    CGEventSetTimestamp(event, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    recordDiagnostic(DiagnosticNativePassed, ReasonFirstTap, 0, DragPhaseIdle,
+                     event, CGEventGetLocation(event), 0, 0, 0, NO, NO);
+    CGEventPost(InputTapLocation, event);
+    CFRelease(event);
+}
+
+static void flushBufferedTapLocked(void) {
+    CGPoint pointer = CGPointZero;
+    BOOL restore = gBufferedTapUp && copyPointerLocation(&pointer) &&
+        locationsDiffer(pointer, CGEventGetLocation(gBufferedTapUp));
+    if (gBufferedTapDown) postBufferedButtonLocked(gBufferedTapDown);
+    if (gBufferedTapUp) postBufferedButtonLocked(gBufferedTapUp);
+    if (restore) {
+        CGEventRef move = createTaggedEvent(kCGEventMouseMoved, pointer, 0);
+        if (move) { CGEventPost(InputTapLocation, move); CFRelease(move); }
+    }
+    discardBufferedTapLocked();
+}
+
+static void expireBufferedTap(unsigned long long token) {
+    os_unfair_lock_lock(&gSyntheticLock);
+    if (token == gBufferedTapToken && gBufferedTapDown) {
+        ChainSnapshot s = chainSnapshot();
+        BOOL deciding = s.device == gBufferedTapDevice &&
+            (s.phase == DragPhaseCandidate || s.phase == DragPhaseStarting);
+        if (deciding && atomic_load(&gEnabled)) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC),
+                dispatch_get_main_queue(), ^{ expireBufferedTap(token); });
+        } else flushBufferedTapLocked();
+    }
+    os_unfair_lock_unlock(&gSyntheticLock);
+}
+
+static BOOL bufferWeChatTapButton(CGEventType type, CGEventRef event) {
+    if (type != kCGEventLeftMouseDown && type != kCGEventLeftMouseUp) return NO;
+    MTDeviceRef device = NULL;
+    if (type == kCGEventLeftMouseDown && atomic_load(&gWeChatPid) > 0 &&
+        CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID) == atomic_load(&gWeChatPid) &&
+        CGEventGetIntegerValueField(event, kCGMouseEventSubtype) == NSEventSubtypeTouch) {
+        os_unfair_lock_lock(&gStateLock);
+        for (int i = 0; i < gDeviceCount; ++i) {
+            DeviceState *s = &gDevices[i];
+            if (replacementActive(s->device) && s->firstTapPending && s->touchingCount == 0) {
+                if (device) { device = NULL; break; }
+                device = s->device;
+            }
+        }
+        os_unfair_lock_unlock(&gStateLock);
+    }
+    os_unfair_lock_lock(&gSyntheticLock);
+    int64_t number = CGEventGetIntegerValueField(event, kCGMouseEventNumber);
+    BOOL consumed = NO;
+    if (gReplayedButtonNumber && type == kCGEventLeftMouseUp && number == gReplayedButtonNumber) {
+        postBufferedButtonLocked(event);
+        gReplayedButtonNumber = 0;
+        consumed = YES;
+    } else if (gBufferedTapDown) {
+        if (type == kCGEventLeftMouseUp && number ==
+            CGEventGetIntegerValueField(gBufferedTapDown, kCGMouseEventNumber)) {
+            if (gBufferedTapUp) CFRelease(gBufferedTapUp);
+            gBufferedTapUp = CGEventCreateCopy(event);
+        } else {
+            // Post both clicks through the same queue; returning the new native
+            // down directly could overtake the replayed first click.
+            flushBufferedTapLocked();
+            postBufferedButtonLocked(event);
+            gReplayedButtonNumber = type == kCGEventLeftMouseDown ? number : 0;
+        }
+        consumed = YES;
+    } else if (device) {
+        gBufferedTapDown = CGEventCreateCopy(event);
+        if (gBufferedTapDown) {
+            gBufferedTapDevice = device;
+            unsigned long long token = ++gBufferedTapToken;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                (doubleTapDragGapMillis() + FirstClickAllowanceMillis) * NSEC_PER_MSEC),
+                dispatch_get_main_queue(), ^{ expireBufferedTap(token); });
+            consumed = YES;
+        }
+    }
+    if (consumed) recordDiagnostic(DiagnosticNativeFiltered, ReasonFirstTap, 0,
+        chainSnapshot().phase, event, CGEventGetLocation(event), 0, 0, 0, NO, NO);
+    os_unfair_lock_unlock(&gSyntheticLock);
+    return consumed;
+}
+
 
 static BOOL startSyntheticDrag(MTDeviceRef device, unsigned long long generation,
                                unsigned long long epoch) {
@@ -840,18 +996,23 @@ static BOOL startSyntheticDrag(MTDeviceRef device, unsigned long long generation
         os_unfair_lock_unlock(&gSyntheticLock); return NO;
     }
     gChain.eventNumber = number; if (phase == DragPhaseStarting) gChain.phase = DragPhaseOwned;
+    if (gBufferedTapDevice == device) {
+        recordDiagnostic(DiagnosticNativeFiltered, ReasonSecondTap, generation, gChain.phase,
+            gBufferedTapDown, start, 0, 0, 0, YES, NO);
+        discardBufferedTapLocked();
+    }
     recordDiagnostic(DiagnosticSyntheticDown, ReasonSecondTap, generation,
         phase, down, start, 0, 0, 0, YES, NO);
-    CGEventPost(kCGHIDEventTap, down); CFRelease(down);
+    CGEventPost(InputTapLocation, down); CFRelease(down);
     if (drag) {
         recordDiagnostic(DiagnosticSyntheticDrag, ReasonMovement,
             generation, phase, drag, latest, 0, 0, 0, YES, NO);
-        CGEventPost(kCGHIDEventTap, drag); CFRelease(drag);
+        CGEventPost(InputTapLocation, drag); CFRelease(drag);
     }
     if (up) {
         recordDiagnostic(DiagnosticSyntheticUp, ReasonLift, generation,
             phase, up, latest, 0, 0, 0, YES, NO);
-        CGEventPost(kCGHIDEventTap, up); CFRelease(up); resetChainLocked(ReasonLift);
+        CGEventPost(InputTapLocation, up); CFRelease(up); resetChainLocked(ReasonLift);
         atomic_store(&gLastOutcome, ReleaseOutcomeReleased);
     } else atomic_store(&gLastOutcome, ReleaseOutcomeOwned);
     os_unfair_lock_unlock(&gChainLock); os_unfair_lock_unlock(&gSyntheticLock); return YES;
@@ -903,6 +1064,10 @@ static void interruptChain(DiagnosticReason reason) {
     } else resetChainLocked(reason);
     os_unfair_lock_unlock(&gChainLock);
     if (up) { postUp(number, location, generation); finishRelease(generation); }
+    os_unfair_lock_lock(&gSyntheticLock);
+    flushBufferedTapLocked();
+    gReplayedButtonNumber = 0;
+    os_unfair_lock_unlock(&gSyntheticLock);
     atomic_store(&gLastOutcome, ReleaseOutcomeInterrupted);
 }
 
@@ -916,28 +1081,47 @@ static NativeDisposition dispositionForEvent(ChainSnapshot snapshot, CGEventType
     return NativePass;
 }
 
-static BOOL prepareNativeMovementAsDrag(CGEventRef event,
-                                        ChainSnapshot snapshot) {
+static CGEventRef createDragFromMovement(CGEventRef movement, int64_t number) {
+    CGEventRef drag = createTaggedEvent(kCGEventLeftMouseDragged,
+                                       CGEventGetLocation(movement), number);
+    if (!drag) return NULL;
+    CGEventSetFlags(drag, CGEventGetFlags(movement));
+    CGEventSetIntegerValueField(drag, kCGMouseEventDeltaX,
+        CGEventGetIntegerValueField(movement, kCGMouseEventDeltaX));
+    CGEventSetIntegerValueField(drag, kCGMouseEventDeltaY,
+        CGEventGetIntegerValueField(movement, kCGMouseEventDeltaY));
+    CGEventSetDoubleValueField(drag, kCGMouseEventPressure, 1.0);
+    return drag;
+}
+
+static BOOL postNativeMovementAsDrag(CGEventRef event, ChainSnapshot snapshot) {
+    // Returning a mutated native event can overtake a posted down. Post the
+    // replacement under the same lock as down/up and consume the native event.
+    os_unfair_lock_lock(&gSyntheticLock);
     os_unfair_lock_lock(&gChainLock);
     BOOL current = gChain.generation == snapshot.generation && gChain.phase == DragPhaseOwned &&
         gChain.eventNumber == snapshot.eventNumber;
     if (!current) {
         os_unfair_lock_unlock(&gChainLock);
+        os_unfair_lock_unlock(&gSyntheticLock);
         return NO;
     }
     CGPoint location = CGEventGetLocation(event);
-    CGEventSetType(event, kCGEventLeftMouseDragged);
-    CGEventSetIntegerValueField(event, kCGEventSourceUserData, DoubleTapTag);
-    CGEventSetIntegerValueField(event, kCGMouseEventNumber,
-                               snapshot.eventNumber);
-    CGEventSetIntegerValueField(event, kCGMouseEventClickState, 1);
-    CGEventSetDoubleValueField(event, kCGMouseEventPressure, 1.0);
-    gChain.latest = location; gChain.latestValid = YES;
-    recordDiagnostic(DiagnosticSyntheticDrag, ReasonMovement,
+    recordDiagnostic(DiagnosticMovementInput, ReasonMovement,
         snapshot.generation, DragPhaseOwned, event, location,
         0, 0, 0, YES, NO);
+    CGEventRef drag = createDragFromMovement(event, snapshot.eventNumber);
+    gChain.latest = location; gChain.latestValid = YES;
+    if (drag) {
+        recordDiagnostic(DiagnosticSyntheticDrag, ReasonMovement,
+            snapshot.generation, DragPhaseOwned, drag, location,
+            0, 0, 0, YES, NO);
+        CGEventPost(InputTapLocation, drag);
+        CFRelease(drag);
+    }
     os_unfair_lock_unlock(&gChainLock);
-    return YES;
+    os_unfair_lock_unlock(&gSyntheticLock);
+    return drag != NULL;
 }
 
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context) {
@@ -968,10 +1152,53 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         return event;
     }
     if (disposition == NativeReplaceDrag &&
-        prepareNativeMovementAsDrag(event, s)) return event;
+        postNativeMovementAsDrag(event, s)) return NULL;
     recordDiagnostic(DiagnosticNativeFiltered, ReasonNone, s.generation, s.phase,
                      event, CGEventGetLocation(event), 0, 0, 0, YES, NO);
     return NULL;
+}
+
+static CGEventRef clickBufferCallback(CGEventTapProxy proxy, CGEventType type,
+                                      CGEventRef event, void *context) {
+    (void)proxy; (void)context;
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        interruptChain(ReasonEventTapDisabled);
+        if (gClickTap) CGEventTapEnable(gClickTap, true);
+        return event;
+    }
+    if (!event || ownEvent(event) || !atomic_load(&gEnabled)) return event;
+    return bufferWeChatTapButton(type, event) ? NULL : event;
+}
+
+static CGEventRef downstreamObserverCallback(CGEventTapProxy proxy, CGEventType type,
+                                             CGEventRef event, void *context) {
+    (void)proxy;
+    BOOL targetObserver = context != NULL;
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        recordDiagnostic(DiagnosticFailure, ReasonObserverDisabled, 0, DragPhaseIdle,
+                         NULL, CGPointZero, 0, 0, 0, NO, NO);
+        CFMachPortRef tap = targetObserver ? gTargetObserverTap : gObserverTap;
+        if (tap) CGEventTapEnable(tap, true);
+        if (targetObserver) {
+            if (!tap || !CGEventTapIsEnabled(tap)) atomic_store(&gObservedTargetPid, 0);
+        } else atomic_store(&gObserverActive, tap && CGEventTapIsEnabled(tap));
+        return event;
+    }
+    if (!event || !atomic_load(&gEnabled)) return event;
+    ChainSnapshot s = chainSnapshot();
+    BOOL active = s.phase != DragPhaseIdle;
+    if (!ownEvent(event) && type != kCGEventLeftMouseDown && type != kCGEventLeftMouseUp &&
+        type != kCGEventLeftMouseDragged && !active)
+        return event;
+    // Released chains may already be reset. The tag and event number still
+    // correlate those observations with their original transaction records.
+    BOOL current = ownEvent(event) && s.eventNumber > 0 &&
+        s.eventNumber == CGEventGetIntegerValueField(event, kCGMouseEventNumber);
+    recordDiagnostic(targetObserver ? DiagnosticTargetObserved : DiagnosticDownstreamObserved, ReasonNone,
+        (current || (!ownEvent(event) && active)) ? s.generation : 0,
+        s.phase, event, CGEventGetLocation(event),
+        0, 0, 0, NO, NO);
+    return event;
 }
 
 static void completeTouch(DeviceState *s, double timestamp, BOOL *candidate,
@@ -1131,15 +1358,75 @@ typedef enum { AccessGranted, AccessRequired } AccessStatus;
     if (gEventTap) { CGEventTapEnable(gEventTap, true); return YES; }
     CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDown) |
         CGEventMaskBit(kCGEventLeftMouseDragged) | CGEventMaskBit(kCGEventLeftMouseUp);
-    gEventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+    // Down, drag, up, and conflicting native buttons share this input stage.
+    gEventTap = CGEventTapCreate(InputTapLocation, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
                                  mask, eventTapCallback, NULL);
     if (!gEventTap) return NO;
     gEventTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gEventTap, 0);
     if (!gEventTapSource) { CFRelease(gEventTap); gEventTap = NULL; return NO; }
-    CFRunLoopAddSource(CFRunLoopGetMain(), gEventTapSource, kCFRunLoopCommonModes); return YES;
+    CFRunLoopAddSource(CFRunLoopGetMain(), gEventTapSource, kCFRunLoopCommonModes);
+    // Target PID at HID can still refer to the previous front application.
+    // Buffer clicks only after WindowServer has annotated their actual target.
+    gClickTap = CGEventTapCreate(kCGAnnotatedSessionEventTap, kCGHeadInsertEventTap,
+        kCGEventTapOptionDefault,
+        CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventLeftMouseUp),
+        clickBufferCallback, NULL);
+    if (gClickTap)
+        gClickTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gClickTap, 0);
+    if (!gClickTapSource) { [self removeEventTap]; return NO; }
+    CFRunLoopAddSource(CFRunLoopGetMain(), gClickTapSource, kCFRunLoopCommonModes);
+    // Observe possible interference without expanding the active filter or
+    // collecting keyboard input. Ordinary moves are relevant during a drag.
+    CGEventMask observerMask = mask | CGEventMaskBit(kCGEventScrollWheel) |
+        CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventRightMouseUp) |
+        CGEventMaskBit(kCGEventRightMouseDragged) | CGEventMaskBit(kCGEventOtherMouseDown) |
+        CGEventMaskBit(kCGEventOtherMouseUp) | CGEventMaskBit(kCGEventOtherMouseDragged) |
+        CGEventMaskBit(kCGEventTabletPointer) | CGEventMaskBit(kCGEventTabletProximity);
+    gObserverTap = CGEventTapCreate(kCGAnnotatedSessionEventTap, kCGTailAppendEventTap,
+        kCGEventTapOptionListenOnly, observerMask, downstreamObserverCallback, NULL);
+    if (gObserverTap) {
+        gObserverTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gObserverTap, 0);
+        if (gObserverTapSource) {
+            CFRunLoopAddSource(CFRunLoopGetMain(), gObserverTapSource, kCFRunLoopCommonModes);
+            atomic_store(&gObserverActive, true);
+        } else {
+            CFMachPortInvalidate(gObserverTap); CFRelease(gObserverTap); gObserverTap = NULL;
+        }
+    }
+    if (!atomic_load(&gObserverActive))
+        recordDiagnostic(DiagnosticFailure, ReasonObserverUnavailable, 0, DragPhaseIdle,
+                         NULL, CGPointZero, 0, 0, 0, NO, NO);
+    NSRunningApplication *wechat = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.tencent.xinWeChat"].firstObject;
+    atomic_store(&gWeChatPid, wechat ? wechat.processIdentifier : 0);
+    if (wechat) {
+        gTargetObserverTap = CGEventTapCreateForPid(wechat.processIdentifier,
+            kCGTailAppendEventTap, kCGEventTapOptionListenOnly, observerMask,
+            downstreamObserverCallback, (void *)(uintptr_t)1);
+        if (gTargetObserverTap) {
+            gTargetObserverTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gTargetObserverTap, 0);
+            if (gTargetObserverTapSource) {
+                CFRunLoopAddSource(CFRunLoopGetMain(), gTargetObserverTapSource, kCFRunLoopCommonModes);
+                atomic_store(&gObservedTargetPid, wechat.processIdentifier);
+            } else {
+                CFMachPortInvalidate(gTargetObserverTap); CFRelease(gTargetObserverTap); gTargetObserverTap = NULL;
+            }
+        }
+        if (!atomic_load(&gObservedTargetPid))
+            recordDiagnostic(DiagnosticFailure, ReasonTargetObserverUnavailable, 0, DragPhaseIdle,
+                             NULL, CGPointZero, 0, 0, 0, NO, NO);
+    }
+    return YES;
 }
 
 - (void)removeEventTap {
+    if (gClickTapSource) { CFRunLoopRemoveSource(CFRunLoopGetMain(), gClickTapSource, kCFRunLoopCommonModes); CFRelease(gClickTapSource); gClickTapSource = NULL; }
+    if (gClickTap) { CFMachPortInvalidate(gClickTap); CFRelease(gClickTap); gClickTap = NULL; }
+    atomic_store(&gObservedTargetPid, 0);
+    if (gTargetObserverTapSource) { CFRunLoopRemoveSource(CFRunLoopGetMain(), gTargetObserverTapSource, kCFRunLoopCommonModes); CFRelease(gTargetObserverTapSource); gTargetObserverTapSource = NULL; }
+    if (gTargetObserverTap) { CFMachPortInvalidate(gTargetObserverTap); CFRelease(gTargetObserverTap); gTargetObserverTap = NULL; }
+    atomic_store(&gObserverActive, false);
+    if (gObserverTapSource) { CFRunLoopRemoveSource(CFRunLoopGetMain(), gObserverTapSource, kCFRunLoopCommonModes); CFRelease(gObserverTapSource); gObserverTapSource = NULL; }
+    if (gObserverTap) { CFMachPortInvalidate(gObserverTap); CFRelease(gObserverTap); gObserverTap = NULL; }
     if (gEventTapSource) { CFRunLoopRemoveSource(CFRunLoopGetMain(), gEventTapSource, kCFRunLoopCommonModes); CFRelease(gEventTapSource); gEventTapSource = NULL; }
     if (gEventTap) { CFMachPortInvalidate(gEventTap); CFRelease(gEventTap); gEventTap = NULL; }
 }

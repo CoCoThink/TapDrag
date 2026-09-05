@@ -1,8 +1,21 @@
+#import <CoreGraphics/CoreGraphics.h>
+static void capturePostedEvent(CGEventTapLocation location, CGEventRef event);
+#define CGEventPost capturePostedEvent
 #define main tapDragApplicationMain
 #include "../TapDrag/Sources/main.m"
 #undef main
+#undef CGEventPost
 
 #include <assert.h>
+
+static CGEventRef postedEvents[16];
+static size_t postedEventCount;
+
+static void capturePostedEvent(CGEventTapLocation location, CGEventRef event) {
+    assert(location == kCGHIDEventTap);
+    assert(postedEventCount < 16);
+    postedEvents[postedEventCount++] = CGEventCreateCopy(event);
+}
 
 static MTTouch touch(uint32_t state, int32_t path, int32_t finger,
                      float x, float y) {
@@ -323,16 +336,121 @@ static void testNativeEventPolicy(void) {
     forceIdle();
 }
 
-static void testGlobalNativeMovementMutation(void) {
+static void clearPostedEvents(void) {
+    for (size_t i = 0; i < postedEventCount; ++i) CFRelease(postedEvents[i]);
+    postedEventCount = 0;
+}
+
+static void testWeChatFirstTapBuffer(void) {
     forceIdle();
+    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x7779;
+    DeviceState savedDevices[MaximumDevices];
+    memcpy(savedDevices, gDevices, sizeof(gDevices));
+    int savedCount = gDeviceCount;
+    gDeviceCount = 1;
+    gDevices[0] = (DeviceState){.device = device, .firstTapPending = YES};
+    atomic_store(&gEnabled, true);
+    atomic_store(&gWeChatPid, 23013);
+    atomic_store(&gInternalDraggingPresent, true);
+    atomic_store(&gInternalDraggingEnabled, false);
+    atomic_store(&gBluetoothDraggingPresent, false);
+    gSyntheticSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    CGPoint pointer = CGPointZero;
+    assert(copyPointerLocation(&pointer));
+    CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
+                                             pointer, kCGMouseButtonLeft);
+    CGEventRef up = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
+                                           pointer, kCGMouseButtonLeft);
+    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23013);
+    CGEventSetIntegerValueField(down, kCGMouseEventSubtype, NSEventSubtypeTouch);
+    CGEventSetIntegerValueField(down, kCGMouseEventNumber, 77);
+    CGEventSetIntegerValueField(up, kCGMouseEventNumber, 77);
+    assert(clickBufferCallback(NULL, kCGEventLeftMouseDown, down, NULL) == NULL);
+    assert(clickBufferCallback(NULL, kCGEventLeftMouseUp, up, NULL) == NULL);
+    assert(postedEventCount == 0);
+    unsigned long long token = gBufferedTapToken;
+    expireBufferedTap(token);
+    assert(postedEventCount == 2);
+    assert(CGEventGetType(postedEvents[0]) == kCGEventLeftMouseDown);
+    assert(CGEventGetType(postedEvents[1]) == kCGEventLeftMouseUp);
+    assert(ownEvent(postedEvents[0]) && ownEvent(postedEvents[1]));
+    expireBufferedTap(token);
+    assert(postedEventCount == 2);
+    clearPostedEvents();
+
+    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    CGEventSetIntegerValueField(down, kCGMouseEventNumber, 78);
+    CGEventSetIntegerValueField(up, kCGMouseEventNumber, 78);
+    CGEventSetIntegerValueField(down, kCGMouseEventClickState, 2);
+    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    assert(postedEventCount == 4);
+    assert(CGEventGetIntegerValueField(postedEvents[2], kCGMouseEventClickState) == 2);
+    assert(CGEventGetType(postedEvents[3]) == kCGEventLeftMouseUp);
+    clearPostedEvents();
+
+    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    token = gBufferedTapToken;
+    gChain = (DragChain){.generation = 500, .phase = DragPhaseStarting, .device = device,
+        .start = CGPointMake(10, 20), .latest = CGPointMake(40, 20),
+        .startValid = YES, .latestValid = YES};
+    assert(startSyntheticDrag(device, 500, atomic_load(&gFeatureEpoch)));
+    assert(gBufferedTapDown == NULL);
+    assert(postedEventCount == 2);
+    assert(CGEventGetType(postedEvents[1]) == kCGEventLeftMouseDragged);
+    expireBufferedTap(token);
+    assert(postedEventCount == 2);
+    interruptChain(ReasonDisabled);
+    assert(postedEventCount == 3);
+    assert(CGEventGetType(postedEvents[2]) == kCGEventLeftMouseUp);
+    clearPostedEvents();
+
+    CGEventSetLocation(down, CGPointMake(pointer.x + 50, pointer.y));
+    CGEventSetLocation(up, CGPointMake(pointer.x + 50, pointer.y));
+    assert(bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    assert(bufferWeChatTapButton(kCGEventLeftMouseUp, up));
+    expireBufferedTap(gBufferedTapToken);
+    assert(postedEventCount == 3);
+    assert(CGEventGetType(postedEvents[2]) == kCGEventMouseMoved);
+    assert(CGPointEqualToPoint(CGEventGetLocation(postedEvents[2]), pointer));
+    clearPostedEvents();
+
+    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 999);
+    assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    CGEventSetIntegerValueField(down, kCGEventTargetUnixProcessID, 23013);
+    atomic_store(&gInternalDraggingEnabled, true);
+    assert(!bufferWeChatTapButton(kCGEventLeftMouseDown, down));
+    CFRelease(down); CFRelease(up); CFRelease(gSyntheticSource);
+    gSyntheticSource = NULL;
+    atomic_store(&gEnabled, false);
+    atomic_store(&gWeChatPid, 0);
+    memcpy(gDevices, savedDevices, sizeof(gDevices));
+    gDeviceCount = savedCount;
+    forceIdle();
+}
+
+static void testSerializedDragTransaction(void) {
+    forceIdle();
+    gSyntheticSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    assert(gSyntheticSource != NULL);
+    atomic_store(&gEnabled, true);
+    atomic_store(&gInternalDraggingPresent, true);
+    atomic_store(&gInternalDraggingEnabled, false);
+    atomic_store(&gBluetoothDraggingPresent, false);
+    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x8888;
     os_unfair_lock_lock(&gChainLock);
     gChain.generation = 100;
-    gChain.phase = DragPhaseOwned;
-    gChain.eventNumber = 72;
+    gChain.phase = DragPhaseStarting;
+    gChain.device = device;
+    gChain.start = gChain.latest = CGPointMake(10, 20);
+    gChain.startValid = gChain.latestValid = YES;
     os_unfair_lock_unlock(&gChainLock);
-    ChainSnapshot snapshot = {.phase = DragPhaseOwned,
-                              .generation = 100,
-                              .eventNumber = 72};
+    assert(startSyntheticDrag(device, 100, atomic_load(&gFeatureEpoch)));
+    ChainSnapshot snapshot = chainSnapshot();
+    assert(postedEventCount == 1);
+    assert(CGEventGetType(postedEvents[0]) == kCGEventLeftMouseDown);
     CGEventRef movement = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
                                                   CGPointMake(11, 21),
                                                   kCGMouseButtonLeft);
@@ -344,25 +462,119 @@ static void testGlobalNativeMovementMutation(void) {
         kCGMouseEventWindowUnderMousePointer, 1234);
     CGEventSetIntegerValueField(movement,
         kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent, 1235);
-    assert(prepareNativeMovementAsDrag(movement, snapshot));
-    assert(CGEventGetType(movement) == kCGEventLeftMouseDragged);
-    assert(ownEvent(movement));
-    assert(CGEventGetIntegerValueField(movement,
-        kCGMouseEventNumber) == 72);
-    assert(CGEventGetIntegerValueField(movement,
-        kCGMouseEventClickState) == 1);
-    // The global path preserves the native event's routing/source metadata.
-    assert(CGEventGetIntegerValueField(movement,
-        kCGEventTargetUnixProcessID) == 4106);
-    assert(CGEventGetIntegerValueField(movement,
-        kCGEventTargetProcessSerialNumber) == 9876);
-    assert(CGEventGetIntegerValueField(movement,
-        kCGMouseEventWindowUnderMousePointer) == 1234);
-    assert(CGEventGetIntegerValueField(movement,
-        kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent) == 1235);
+    CGEventSetIntegerValueField(movement, kCGMouseEventDeltaX, -8);
+    CGEventSetIntegerValueField(movement, kCGMouseEventDeltaY, 3);
+    CGEventSetFlags(movement, kCGEventFlagMaskShift);
+    assert(eventTapCallback(NULL, kCGEventMouseMoved, movement, NULL) == NULL);
+    assert(postedEventCount == 2);
+    CGEventRef drag = postedEvents[1];
+    assert(CGEventGetType(drag) == kCGEventLeftMouseDragged);
+    assert(CGEventGetType(movement) == kCGEventMouseMoved);
+    assert(CGPointEqualToPoint(CGEventGetLocation(drag), CGPointMake(11, 21)));
+    assert(CGEventGetFlags(drag) == kCGEventFlagMaskShift);
+    assert(CGEventGetIntegerValueField(drag, kCGMouseEventDeltaX) == -8);
+    assert(CGEventGetIntegerValueField(drag, kCGMouseEventDeltaY) == 3);
+    assert(CGEventGetDoubleValueField(drag, kCGMouseEventPressure) == 1.0);
+    assert(CGEventGetIntegerValueField(drag, kCGEventTargetUnixProcessID) != 4106);
+    assert(CGEventGetIntegerValueField(drag, kCGMouseEventWindowUnderMousePointer) != 1234);
+    // Posted events must pass through without being converted or posted again.
+    assert(eventTapCallback(NULL, kCGEventLeftMouseDragged, drag, NULL) == drag);
+    assert(postedEventCount == 2);
+
+    int64_t number = 0;
+    CGPoint location = CGPointZero;
+    assert(requestRelease(snapshot.generation, &number, &location) == ReleaseCaller);
+    assert(!postNativeMovementAsDrag(movement, snapshot));
+    assert(postUp(number, location, snapshot.generation));
+    assert(finishRelease(snapshot.generation));
+    assert(!postNativeMovementAsDrag(movement, snapshot));
+    assert(postedEventCount == 3);
+    assert(CGEventGetType(postedEvents[2]) == kCGEventLeftMouseUp);
+    for (size_t i = 0; i < postedEventCount; i++) {
+        assert(ownEvent(postedEvents[i]));
+        assert(CGEventGetIntegerValueField(postedEvents[i], kCGMouseEventNumber) == number);
+        assert(CGEventGetIntegerValueField(postedEvents[i], kCGMouseEventClickState) == 1);
+        assert(CGEventGetIntegerValueField(postedEvents[i], kCGMouseEventSubtype) == NSEventSubtypeTouch);
+        assert([NSEvent eventWithCGEvent:postedEvents[i]].subtype == NSEventSubtypeTouch);
+        assert(CGEventGetIntegerValueField(postedEvents[i], kCGEventSourceUnixProcessID) == getpid());
+        assert(CGEventGetTimestamp(postedEvents[i]) > 0);
+        if (i) assert(CGEventGetTimestamp(postedEvents[i]) >= CGEventGetTimestamp(postedEvents[i - 1]));
+    }
+    for (size_t i = 0; i < postedEventCount; i++) CFRelease(postedEvents[i]);
+    postedEventCount = 0;
     CFRelease(movement);
+    CFRelease(gSyntheticSource);
+    gSyntheticSource = NULL;
+    atomic_store(&gEnabled, false);
     forceIdle();
 }
+
+static void testDownstreamObserverDoesNotChangeOwnership(void) {
+    forceIdle();
+    clearRecords();
+    atomic_store(&gEnabled, true);
+    os_unfair_lock_lock(&gChainLock);
+    gChain.generation = 200;
+    gChain.phase = DragPhaseOwned;
+    gChain.eventNumber = 91;
+    os_unfair_lock_unlock(&gChainLock);
+    CGEventRef event = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
+                                              CGPointMake(40, 50), kCGMouseButtonLeft);
+    assert(event != NULL);
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData, DoubleTapTag);
+    CGEventSetIntegerValueField(event, kCGMouseEventNumber, 91);
+    assert(downstreamObserverCallback(NULL, kCGEventLeftMouseDown, event, NULL) == event);
+    assert(chainSnapshot().phase == DragPhaseOwned);
+    assert(CGEventGetType(event) == kCGEventLeftMouseDown);
+
+    forceIdle();
+    CGEventSetType(event, kCGEventLeftMouseUp);
+    assert(downstreamObserverCallback(NULL, kCGEventLeftMouseUp, event, NULL) == event);
+    assert(chainSnapshot().phase == DragPhaseIdle);
+    assert(CGEventGetIntegerValueField(event, kCGMouseEventNumber) == 91);
+    DiagnosticRecord records[8] = {0};
+    size_t count = copyRecords(records, 8, NULL);
+    assert(count == 3);
+    assert(records[0].kind == DiagnosticDownstreamObserved);
+    assert(records[0].generation == 200);
+    assert(records[2].kind == DiagnosticDownstreamObserved);
+    assert(records[2].generation == 0);
+    assert(records[2].eventNumber == 91);
+
+    CFRelease(event);
+    event = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                    CGPointMake(45, 50), kCGMouseButtonLeft);
+    assert(event != NULL && !ownEvent(event));
+    downstreamObserverCallback(NULL, kCGEventMouseMoved, event, NULL);
+    assert(copyRecords(records, 8, NULL) == count);
+
+    // Losing diagnostics must never interrupt or release an active drag.
+    os_unfair_lock_lock(&gChainLock);
+    gChain.phase = DragPhaseOwned;
+    gChain.eventNumber = 92;
+    os_unfair_lock_unlock(&gChainLock);
+    // A leaked native move must be visible at both observer stages, but the
+    // observers must neither consume it nor turn it into another drag.
+    assert(downstreamObserverCallback(NULL, kCGEventMouseMoved, event, NULL) == event);
+    assert(downstreamObserverCallback(NULL, kCGEventMouseMoved, event,
+                                     (void *)(uintptr_t)1) == event);
+    assert(CGEventGetType(event) == kCGEventMouseMoved);
+    count = copyRecords(records, 8, NULL);
+    assert(count == 5);
+    assert(records[3].kind == DiagnosticDownstreamObserved);
+    assert(records[4].kind == DiagnosticTargetObserved);
+    assert(records[4].generation == chainSnapshot().generation);
+    assert(records[4].eventType == kCGEventMouseMoved);
+    downstreamObserverCallback(NULL, kCGEventTapDisabledByTimeout, NULL, NULL);
+    assert(chainSnapshot().phase == DragPhaseOwned);
+    atomic_store(&gEnabled, false);
+    count = copyRecords(records, 8, NULL);
+    downstreamObserverCallback(NULL, kCGEventLeftMouseUp, event, NULL);
+    assert(copyRecords(records, 8, NULL) == count);
+    CFRelease(event);
+    forceIdle();
+}
+
 
 static BOOL fakeDeviceIsBuiltIn(MTDeviceRef device) {
     return device == (MTDeviceRef)(uintptr_t)1;
@@ -392,6 +604,7 @@ static void testSyntheticEventMetadata(void) {
     assert(ownEvent(down));
     assert(CGEventGetIntegerValueField(down, kCGMouseEventNumber) == 42);
     assert(CGEventGetIntegerValueField(down, kCGMouseEventClickState) == 1);
+    assert(CGEventGetIntegerValueField(down, kCGMouseEventSubtype) == NSEventSubtypeTouch);
     assert(CGEventGetIntegerValueField(down, kCGEventSourceStateID) ==
            kCGEventSourceStateHIDSystemState);
     assert(CGEventGetIntegerValueField(down, kCGEventSourceUnixProcessID) ==
@@ -438,7 +651,9 @@ int main(void) {
     testOwnedReleaseOwnership();
     testStaleGenerationCannotReleaseNewDrag();
     testNativeEventPolicy();
-    testGlobalNativeMovementMutation();
+    testWeChatFirstTapBuffer();
+    testSerializedDragTransaction();
+    testDownstreamObserverDoesNotChangeOwnership();
     testDeviceSpecificDraggingPreferences();
     testSyntheticEventMetadata();
     testDiagnosticRing();
