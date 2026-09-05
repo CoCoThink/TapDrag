@@ -107,9 +107,15 @@ typedef enum {
     ReasonObserverUnavailable,
     ReasonObserverDisabled,
     ReasonTargetObserverUnavailable,
+    ReasonBufferModeChanged,
 } DiagnosticReason;
 
 typedef enum { NativePass, NativeFilter, NativeReplaceDrag } NativeDisposition;
+
+typedef enum {
+    FirstTapBufferCompatibility,
+    FirstTapBufferUniversal,
+} FirstTapBufferMode;
 
 typedef struct {
     MTDeviceRef device;
@@ -127,6 +133,9 @@ typedef struct {
     float maximumSquaredDistance, maximumSquaredDistanceMM;
     BOOL firstTapPending;
     double firstTapCompletedTimestamp;
+    uint64_t firstTapCompletedUptime;
+    CGPoint firstTapPointer;
+    BOOL firstTapPointerValid;
     BOOL chainCandidate;
     unsigned long long chainGeneration;
     BOOL movementConfirmed, holdConfirmed, startRequested;
@@ -203,12 +212,15 @@ static CFRunLoopSourceRef gTargetObserverTapSource = NULL;
 static atomic_int gObservedTargetPid = 0;
 static atomic_int gWeChatPid = 0;
 static atomic_int gDockPid = 0;
+static atomic_int gFirstTapBufferMode = FirstTapBufferCompatibility;
 // Protected by gSyntheticLock; native first clicks must not precede a
 // replacement drag in applications that recognize double-clicks themselves.
 static CGEventRef gBufferedTapDown = NULL, gBufferedTapUp = NULL;
 static MTDeviceRef gBufferedTapDevice = NULL;
 static unsigned long long gBufferedTapToken = 0;
 static int64_t gReplayedButtonNumber = 0;
+static pid_t gReplayedButtonTargetPid = 0;
+static pid_t gBufferedTapTargetPid = 0;
 static MTDeviceIsBuiltInFunction gDeviceIsBuiltIn = NULL;
 
 static DiagnosticRecord gRecords[DiagnosticCapacity];
@@ -224,6 +236,7 @@ static NSURL *gAutomaticLogURL = nil;
 
 static NSString *const EnabledKey = @"DoubleTapDragReleaseEnabled";
 static NSString *const AutomaticLoggingKey = @"AutomaticDiagnosticLoggingEnabled";
+static NSString *const FirstTapBufferModeKey = @"FirstTapBufferMode";
 static const int64_t DoubleTapTag = 0x3346444E45574452LL;
 static const long long MinimumSecondContactGapMillis = 30;
 static const long long MaximumSecondTapGapMillis = 160;
@@ -232,6 +245,7 @@ static const double MaximumFirstTapDurationSeconds = 0.25;
 static const float TapMoveThresholdMillimeters = 1.3f;
 static const float FallbackNormalizedMoveThreshold = 0.010f;
 static const long long FirstClickAllowanceMillis = 40;
+static const double MaximumFirstTapEventDistancePoints = 12.0;
 static const CGEventTapLocation InputTapLocation = kCGHIDEventTap;
 
 static long long nowMillis(void) {
@@ -248,6 +262,15 @@ static long long doubleTapDragGapForSystemMillis(long long systemInterval) {
 
 static long long doubleTapDragGapMillis(void) {
     return doubleTapDragGapForSystemMillis(doubleClickIntervalMillis());
+}
+
+static NSString *firstTapBufferModeName(FirstTapBufferMode mode) {
+    return mode == FirstTapBufferUniversal ? @"universal" : @"compatibility";
+}
+
+static FirstTapBufferMode validatedFirstTapBufferMode(NSInteger value) {
+    return value == FirstTapBufferUniversal
+        ? FirstTapBufferUniversal : FirstTapBufferCompatibility;
 }
 
 
@@ -365,6 +388,7 @@ static NSString *reasonName(DiagnosticReason reason) {
         case ReasonObserverUnavailable: return @"observer_unavailable";
         case ReasonObserverDisabled: return @"observer_disabled";
         case ReasonTargetObserverUnavailable: return @"target_observer_unavailable";
+        case ReasonBufferModeChanged: return @"buffer_mode_changed";
     }
     return @"unknown";
 }
@@ -500,15 +524,20 @@ static NSString *traceText(NSString *capture) {
         @"synthetic_mouse_subtype": @(NSEventSubtypeTouch),
         @"wechat_first_tap_buffer": @YES,
         @"dock_first_tap_buffer": @YES,
+        @"first_tap_buffer_mode": firstTapBufferModeName(
+            validatedFirstTapBufferMode(atomic_load(&gFirstTapBufferMode))),
+        @"universal_first_tap_buffer": @(
+            atomic_load(&gFirstTapBufferMode) == FirstTapBufferUniversal),
         @"wechat_pid": @(atomic_load(&gWeChatPid)),
         @"dock_pid": @(atomic_load(&gDockPid)),
         @"downstream_observer_active": @(atomic_load(&gObserverActive)),
         @"target_observer_pid": @(atomic_load(&gObservedTargetPid)),
-        @"diagnostic_schema": @3,
+        @"diagnostic_schema": @4,
         @"system_double_click_ms": @(doubleClickIntervalMillis()),
         @"minimum_second_contact_gap_ms": @(MinimumSecondContactGapMillis),
         @"double_tap_drag_gap_ms": @(doubleTapDragGapMillis()),
         @"first_tap_max_ms": @((int)llround(MaximumFirstTapDurationSeconds * 1000.0)),
+        @"first_tap_event_distance_points": @(MaximumFirstTapEventDistancePoints),
         @"second_contact_hold_ms": @(SecondContactHoldMillis),
         @"movement_threshold_mm": @(TapMoveThresholdMillimeters)};
     NSMutableArray *objects = [NSMutableArray arrayWithObject:header];
@@ -645,9 +674,17 @@ static void resetCurrentTouch(DeviceState *s) {
     s->movementConfirmed = s->holdConfirmed = s->startRequested = NO;
 }
 
+static void clearPendingFirstTap(DeviceState *s) {
+    s->firstTapPending = NO;
+    s->firstTapCompletedTimestamp = 0;
+    s->firstTapCompletedUptime = 0;
+    s->firstTapPointer = CGPointZero;
+    s->firstTapPointerValid = NO;
+}
+
 static void resetDevice(DeviceState *s) {
     resetCurrentTouch(s); s->touchingCount = s->maximumTouching = 0;
-    s->firstTapPending = NO; s->firstTapCompletedTimestamp = 0;
+    clearPendingFirstTap(s);
 }
 
 static void resetAllDevicesLocked(void) {
@@ -875,6 +912,7 @@ static void discardBufferedTapLocked(void) {
     if (gBufferedTapUp) CFRelease(gBufferedTapUp);
     gBufferedTapDown = gBufferedTapUp = NULL;
     gBufferedTapDevice = NULL;
+    gBufferedTapTargetPid = 0;
     ++gBufferedTapToken;
 }
 
@@ -928,21 +966,44 @@ static BOOL eventTargetRequiresFirstClickBuffer(CGEventRef event) {
     return pidRequiresFirstClickBuffer(targetPid);
 }
 
+static BOOL universalCandidateMatchesEvent(const DeviceState *state,
+                                           CGEventRef event,
+                                           uint64_t now) {
+    if (!state->firstTapPending || state->touchingCount != 0 ||
+        !state->firstTapPointerValid || state->firstTapCompletedUptime == 0 ||
+        now < state->firstTapCompletedUptime) return NO;
+    uint64_t maximumAge = (uint64_t)(doubleTapDragGapMillis() +
+        FirstClickAllowanceMillis) * NSEC_PER_MSEC;
+    if (now - state->firstTapCompletedUptime > maximumAge) return NO;
+    CGPoint eventLocation = CGEventGetLocation(event);
+    return hypot(eventLocation.x - state->firstTapPointer.x,
+                 eventLocation.y - state->firstTapPointer.y) <=
+        MaximumFirstTapEventDistancePoints;
+}
+
 static BOOL bufferSpecialTapButton(CGEventType type, CGEventRef event) {
     if (type != kCGEventLeftMouseDown && type != kCGEventLeftMouseUp) return NO;
     MTDeviceRef device = NULL;
+    FirstTapBufferMode mode = validatedFirstTapBufferMode(
+        atomic_load(&gFirstTapBufferMode));
     if (type == kCGEventLeftMouseDown &&
         CGEventGetIntegerValueField(event, kCGMouseEventSubtype) == NSEventSubtypeTouch) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         os_unfair_lock_lock(&gStateLock);
         for (int i = 0; i < gDeviceCount; ++i) {
             DeviceState *s = &gDevices[i];
-            if (replacementActive(s->device) && s->firstTapPending && s->touchingCount == 0) {
+            BOOL matches = replacementActive(s->device) && s->firstTapPending &&
+                s->touchingCount == 0;
+            if (matches && mode == FirstTapBufferUniversal)
+                matches = universalCandidateMatchesEvent(s, event, now);
+            if (matches) {
                 if (device) { device = NULL; break; }
                 device = s->device;
             }
         }
         os_unfair_lock_unlock(&gStateLock);
-        if (device && !eventTargetRequiresFirstClickBuffer(event)) device = NULL;
+        if (device && mode == FirstTapBufferCompatibility &&
+            !eventTargetRequiresFirstClickBuffer(event)) device = NULL;
     }
     os_unfair_lock_lock(&gSyntheticLock);
     int64_t number = CGEventGetIntegerValueField(event, kCGMouseEventNumber);
@@ -950,6 +1011,7 @@ static BOOL bufferSpecialTapButton(CGEventType type, CGEventRef event) {
     if (gReplayedButtonNumber && type == kCGEventLeftMouseUp && number == gReplayedButtonNumber) {
         postBufferedButtonLocked(event);
         gReplayedButtonNumber = 0;
+        gReplayedButtonTargetPid = 0;
         consumed = YES;
     } else if (gBufferedTapDown) {
         if (type == kCGEventLeftMouseUp && number ==
@@ -962,12 +1024,16 @@ static BOOL bufferSpecialTapButton(CGEventType type, CGEventRef event) {
             flushBufferedTapLocked();
             postBufferedButtonLocked(event);
             gReplayedButtonNumber = type == kCGEventLeftMouseDown ? number : 0;
+            gReplayedButtonTargetPid = type == kCGEventLeftMouseDown
+                ? (pid_t)CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID) : 0;
         }
         consumed = YES;
     } else if (device) {
         gBufferedTapDown = CGEventCreateCopy(event);
         if (gBufferedTapDown) {
             gBufferedTapDevice = device;
+            gBufferedTapTargetPid = (pid_t)CGEventGetIntegerValueField(
+                event, kCGEventTargetUnixProcessID);
             unsigned long long token = ++gBufferedTapToken;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                 (doubleTapDragGapMillis() + FirstClickAllowanceMillis) * NSEC_PER_MSEC),
@@ -1089,6 +1155,7 @@ static void interruptChain(DiagnosticReason reason) {
     os_unfair_lock_lock(&gSyntheticLock);
     flushBufferedTapLocked();
     gReplayedButtonNumber = 0;
+    gReplayedButtonTargetPid = 0;
     os_unfair_lock_unlock(&gSyntheticLock);
     atomic_store(&gLastOutcome, ReleaseOutcomeInterrupted);
 }
@@ -1230,20 +1297,22 @@ static void completeTouch(DeviceState *s, double timestamp, BOOL *candidate,
     atomic_store(&gLastDurationMillis, duration); atomic_store(&gLastFrames, s->touchingFrames);
     DiagnosticReason reason = ReasonNone; DiagnosticKind kind = DiagnosticReset;
     if (s->touchInvalid) {
-        s->firstTapPending = NO; atomic_store(&gLastOutcome, ReleaseOutcomeInvalid); reason = ReasonMultiFinger;
+        clearPendingFirstTap(s); atomic_store(&gLastOutcome, ReleaseOutcomeInvalid); reason = ReasonMultiFinger;
     } else if (!s->chainCandidate && s->nativeButtonDownDuringTouch) {
-        s->firstTapPending = NO; s->firstTapCompletedTimestamp = 0;
+        clearPendingFirstTap(s);
         atomic_store(&gLastOutcome, ReleaseOutcomeWaiting);
         reason = ReasonNativeButtonDuringTouch;
     } else if (s->chainCandidate) {
-        s->firstTapPending = NO; atomic_store(&gLastOutcome, s->movementConfirmed ? ReleaseOutcomeStarting : ReleaseOutcomeSecondTapNoDrag);
+        clearPendingFirstTap(s); atomic_store(&gLastOutcome, s->movementConfirmed ? ReleaseOutcomeStarting : ReleaseOutcomeSecondTapNoDrag);
         reason = s->movementConfirmed ? (s->holdConfirmed ? ReasonHold : ReasonMovement) : ReasonNoMovement;
     } else if (s->touchMade && duration <= MaximumFirstTapDurationSeconds * 1000.0 &&
                !s->touchMoved) {
         s->firstTapPending = YES; s->firstTapCompletedTimestamp = timestamp;
+        s->firstTapCompletedUptime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        s->firstTapPointerValid = copyPointerLocation(&s->firstTapPointer);
         atomic_store(&gLastOutcome, ReleaseOutcomeFirstTap); reason = ReasonFirstTap; kind = DiagnosticFirstTap;
     } else {
-        s->firstTapPending = NO; s->firstTapCompletedTimestamp = 0;
+        clearPendingFirstTap(s);
         if (s->touchMade) reason = duration > MaximumFirstTapDurationSeconds * 1000.0
             ? ReasonTapTooLong : ReasonTapMoved;
     }
@@ -1304,7 +1373,7 @@ static int contactFrameCallback(MTDeviceRef device, void *contacts, int contactC
                     recordDiagnosticDetails(DiagnosticReset, reason,
                         0, chainSnapshot().phase, NULL, s->pointerStart, 0, gap, 0,
                         0, count, NO, NO);
-                    s->firstTapPending = NO; s->firstTapCompletedTimestamp = 0;
+                    clearPendingFirstTap(s);
                 }
             }
             if (s->chainCandidate && s->touchMoved) {
@@ -1375,6 +1444,7 @@ static CGEventMask diagnosticMouseMask(void) {
 @property(strong) NSMenuItem *launchAtLoginItem, *loginApprovalItem;
 @property(strong) NSMenuItem *replacementStatus, *runtimeStatus, *diagnosticStatus, *accessibilityItem;
 @property(strong) NSMenuItem *automaticLoggingItem;
+@property(strong) NSMenuItem *compatibilityBufferItem, *universalBufferItem;
 @property(assign) CFArrayRef deviceList;
 @property(assign) void *multitouchHandle;
 @property(assign) BOOL trackingTargets;
@@ -1413,12 +1483,18 @@ static CGEventMask diagnosticMouseMask(void) {
 }
 
 - (void)updateWeChatPid:(pid_t)pid {
-    if (atomic_load(&gWeChatPid) != pid) {
+    pid_t previousPid = atomic_load(&gWeChatPid);
+    if (previousPid != pid) {
         // A buffered click belongs to the old process. Never replay it into
         // another window after that process exits; invalidate its timer too.
         os_unfair_lock_lock(&gSyntheticLock);
-        discardBufferedTapLocked();
-        gReplayedButtonNumber = 0;
+        if (previousPid > 0 && gBufferedTapTargetPid == previousPid) {
+            discardBufferedTapLocked();
+        }
+        if (previousPid > 0 && gReplayedButtonTargetPid == previousPid) {
+            gReplayedButtonNumber = 0;
+            gReplayedButtonTargetPid = 0;
+        }
         atomic_store(&gWeChatPid, pid);
         os_unfair_lock_unlock(&gSyntheticLock);
         [self removeTargetObserver];
@@ -1432,10 +1508,16 @@ static CGEventMask diagnosticMouseMask(void) {
 }
 
 - (void)updateDockPid:(pid_t)pid {
-    if (atomic_load(&gDockPid) == pid) return;
+    pid_t previousPid = atomic_load(&gDockPid);
+    if (previousPid == pid) return;
     os_unfair_lock_lock(&gSyntheticLock);
-    discardBufferedTapLocked();
-    gReplayedButtonNumber = 0;
+    if (previousPid > 0 && gBufferedTapTargetPid == previousPid) {
+        discardBufferedTapLocked();
+    }
+    if (previousPid > 0 && gReplayedButtonTargetPid == previousPid) {
+        gReplayedButtonNumber = 0;
+        gReplayedButtonTargetPid = 0;
+    }
     atomic_store(&gDockPid, pid);
     os_unfair_lock_unlock(&gSyntheticLock);
 }
@@ -1615,6 +1697,12 @@ static CGEventMask diagnosticMouseMask(void) {
         self.automaticLoggingItem.state = atomic_load(&gAutomaticLoggingEnabled)
             ? NSControlStateValueOn : NSControlStateValueOff;
     }
+    FirstTapBufferMode mode = validatedFirstTapBufferMode(
+        atomic_load(&gFirstTapBufferMode));
+    self.compatibilityBufferItem.state = mode == FirstTapBufferCompatibility
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    self.universalBufferItem.state = mode == FirstTapBufferUniversal
+        ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
 - (NSMenuItem *)item:(NSString *)title action:(SEL)action menu:(NSMenu *)menu {
@@ -1634,6 +1722,13 @@ static CGEventMask diagnosticMouseMask(void) {
     self.launchAtLoginItem = [self item:@"Launch at Login" action:@selector(toggleLaunchAtLogin:) menu:menu];
     self.loginApprovalItem = [self item:@"Approve Launch at Login..." action:@selector(openLoginItemsSettings:) menu:menu];
     self.loginApprovalItem.hidden = YES;
+    NSMenuItem *bufferRoot = [[NSMenuItem alloc] initWithTitle:@"First Tap Buffering" action:nil keyEquivalent:@""];
+    NSMenu *bufferMenu = [[NSMenu alloc] initWithTitle:@"First Tap Buffering"];
+    self.compatibilityBufferItem = [self item:@"Compatibility (WeChat & Dock)"
+        action:@selector(selectCompatibilityBuffering:) menu:bufferMenu];
+    self.universalBufferItem = [self item:@"Universal (All Trackpad Taps)"
+        action:@selector(selectUniversalBuffering:) menu:bufferMenu];
+    bufferRoot.submenu = bufferMenu; [menu addItem:bufferRoot];
     self.replacementStatus = [self item:@"TapDrag: checking" action:nil menu:menu]; self.replacementStatus.enabled = NO;
     self.runtimeStatus = [self item:@"Last gesture: waiting" action:nil menu:menu]; self.runtimeStatus.enabled = NO;
     NSMenuItem *root = [[NSMenuItem alloc] initWithTitle:@"Diagnostics" action:nil keyEquivalent:@""];
@@ -1678,12 +1773,37 @@ static CGEventMask diagnosticMouseMask(void) {
     [self updateStatus];
 }
 
+- (void)setFirstTapBufferMode:(FirstTapBufferMode)mode {
+    mode = validatedFirstTapBufferMode(mode);
+    if (mode == validatedFirstTapBufferMode(atomic_load(&gFirstTapBufferMode))) {
+        [self updateStatus];
+        return;
+    }
+    atomic_fetch_add(&gFeatureEpoch, 1);
+    interruptChain(ReasonBufferModeChanged);
+    os_unfair_lock_lock(&gStateLock);
+    resetAllDevicesLocked();
+    os_unfair_lock_unlock(&gStateLock);
+    atomic_store(&gFirstTapBufferMode, mode);
+    [[NSUserDefaults standardUserDefaults] setInteger:mode forKey:FirstTapBufferModeKey];
+    atomic_store(&gLoggingDirty, true);
+    [self updateStatus];
+}
+
+- (void)selectCompatibilityBuffering:(id)sender {
+    (void)sender; [self setFirstTapBufferMode:FirstTapBufferCompatibility];
+}
+
+- (void)selectUniversalBuffering:(id)sender {
+    (void)sender; [self setFirstTapBufferMode:FirstTapBufferUniversal];
+}
+
 - (void)requestAccessibility:(id)sender { (void)sender; AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES}); }
 - (void)copyDiagnostics:(id)sender { (void)sender; NSPasteboard *p = NSPasteboard.generalPasteboard; [p clearContents]; [p setString:traceText(@"manual_copy") forType:NSPasteboardTypeString]; }
 - (void)exportDiagnostics:(id)sender { (void)sender; NSSavePanel *p = NSSavePanel.savePanel; p.nameFieldStringValue = @"TapDrag-diagnostics.jsonl"; UTType *type = [UTType typeWithFilenameExtension:@"jsonl"]; if (type) p.allowedContentTypes = @[type]; if ([p runModal] == NSModalResponseOK && p.URL) [traceText(@"manual_export") writeToURL:p.URL atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
 - (void)revealDiagnostics:(id)sender { (void)sender; NSURL *url = gAutomaticLogURL ? gAutomaticLogURL.URLByDeletingLastPathComponent : logDirectoryURL(); [[NSFileManager defaultManager] createDirectoryAtURL:url withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@(0700)} error:nil]; [[NSWorkspace sharedWorkspace] openURL:url]; }
 - (void)clearDiagnostics:(id)sender { (void)sender; clearRecords(); [self updateStatus]; }
-- (void)hideStatusItem:(id)sender { (void)sender; if (!self.statusItem) return; [[NSStatusBar systemStatusBar] removeStatusItem:self.statusItem]; self.statusItem = nil; self.enabledItem = nil; self.launchAtLoginItem = self.loginApprovalItem = self.automaticLoggingItem = nil; self.replacementStatus = self.runtimeStatus = self.diagnosticStatus = self.accessibilityItem = nil; }
+- (void)hideStatusItem:(id)sender { (void)sender; if (!self.statusItem) return; [[NSStatusBar systemStatusBar] removeStatusItem:self.statusItem]; self.statusItem = nil; self.enabledItem = nil; self.launchAtLoginItem = self.loginApprovalItem = self.automaticLoggingItem = nil; self.compatibilityBufferItem = self.universalBufferItem = nil; self.replacementStatus = self.runtimeStatus = self.diagnosticStatus = self.accessibilityItem = nil; }
 
 - (void)menuWillOpen:(NSMenu *)menu {
     if (menu != self.statusItem.menu) return; BOOL old = atomic_load(&gAnyNativeDraggingEnabled); refreshDraggingPreferences();
@@ -1711,9 +1831,13 @@ static CGEventMask diagnosticMouseMask(void) {
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    (void)notification; [[NSUserDefaults standardUserDefaults] registerDefaults:@{EnabledKey:@YES, AutomaticLoggingKey:@YES}];
+    (void)notification; [[NSUserDefaults standardUserDefaults] registerDefaults:@{
+        EnabledKey:@YES, AutomaticLoggingKey:@YES,
+        FirstTapBufferModeKey:@(FirstTapBufferCompatibility)}];
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     atomic_store(&gAutomaticLoggingEnabled, [d boolForKey:AutomaticLoggingKey]);
+    atomic_store(&gFirstTapBufferMode,
+        validatedFirstTapBufferMode([d integerForKey:FirstTapBufferModeKey]));
     gNextEventNumber = SyntheticEventNumberMinimum + arc4random_uniform(SyntheticEventNumberMaximum); gSyntheticSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState); if (gSyntheticSource) CGEventSourceSetLocalEventsSuppressionInterval(gSyntheticSource, 0);
     refreshDraggingPreferences(); if ([d boolForKey:EnabledKey] && [self accessStatus:NO] == AccessGranted && [self installEventTap]) { atomic_store(&gEnabled, true); if (atomic_load(&gAutomaticLoggingEnabled)) startLogging(); }
     [self setupStatusItem]; [self startMultitouch];
