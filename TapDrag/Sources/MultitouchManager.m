@@ -26,8 +26,6 @@ typedef int (*MTDeviceStopFunction)(TDMTDeviceRef);
     MTRegisterContactFrameCallbackFunction _registerContactCallback;
     MTDeviceStartFunction _startDevice;
     MTDeviceStopFunction _stopDevice;
-    TDMTDeviceGetSensorDimensionsFunction _sensorDimensions;
-    TDMTDeviceIsBuiltInFunction _deviceIsBuiltIn;
     BOOL _frameworkAvailable;
     BOOL _invalidated;
 }
@@ -72,15 +70,16 @@ static void topologyChanged(void *context, io_iterator_t iterator) {
         self.frameworkHandle, "MTDeviceStart");
     _stopDevice = (MTDeviceStopFunction)dlsym(
         self.frameworkHandle, "MTDeviceStop");
-    _sensorDimensions = (TDMTDeviceGetSensorDimensionsFunction)dlsym(
-        self.frameworkHandle, "MTDeviceGetSensorDimensions");
-    _deviceIsBuiltIn = (TDMTDeviceIsBuiltInFunction)dlsym(
-        self.frameworkHandle, "MTDeviceIsBuiltIn");
+    TDMTDeviceGetSensorDimensionsFunction sensorDimensions =
+        (TDMTDeviceGetSensorDimensionsFunction)dlsym(
+            self.frameworkHandle, "MTDeviceGetSensorDimensions");
+    TDMTDeviceIsBuiltInFunction deviceIsBuiltIn =
+        (TDMTDeviceIsBuiltInFunction)dlsym(self.frameworkHandle, "MTDeviceIsBuiltIn");
 
     _frameworkAvailable = (_createList || _createDefault) &&
         _registerContactCallback && _startDevice && _stopDevice;
     if (!_frameworkAvailable) return NO;
-    TDGestureEngineConfigureMultitouch(_deviceIsBuiltIn, _sensorDimensions);
+    TDGestureEngineConfigureMultitouch(deviceIsBuiltIn, sensorDimensions);
     return YES;
 }
 
@@ -212,8 +211,6 @@ static void topologyChanged(void *context, io_iterator_t iterator) {
     _registerContactCallback = NULL;
     _startDevice = NULL;
     _stopDevice = NULL;
-    _sensorDimensions = NULL;
-    _deviceIsBuiltIn = NULL;
     _frameworkAvailable = NO;
 }
 

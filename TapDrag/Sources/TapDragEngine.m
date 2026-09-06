@@ -466,7 +466,7 @@ static size_t copyRecords(DiagnosticRecord *output, size_t capacity,
     return count;
 }
 
-static void clearRecords(void) {
+void TDGestureEngineClearDiagnostics(void) {
     os_unfair_lock_lock(&gDiagnosticLock);
     gRecordSequence = 0;
     memset(gRecords, 0, sizeof(gRecords));
@@ -506,7 +506,7 @@ static NSDictionary *recordDictionary(DiagnosticRecord r) {
              @"native_dragging_enabled": @(r.nativeDragging != 0)};
 }
 
-static NSString *traceText(NSString *capture) {
+NSString *TDGestureEngineDiagnosticText(NSString *capture) {
     DiagnosticRecord *records = calloc(DiagnosticCapacity, sizeof(*records));
     if (records == NULL) return @"";
     unsigned int dropped = 0;
@@ -540,7 +540,7 @@ static NSString *traceText(NSString *capture) {
     return text;
 }
 
-static NSURL *logDirectoryURL(void) {
+NSURL *TDGestureEngineDiagnosticDirectoryURL(void) {
     NSURL *library = [[[NSFileManager defaultManager] URLsForDirectory:NSLibraryDirectory
                                                               inDomains:NSUserDomainMask] firstObject];
     return [[[library URLByAppendingPathComponent:@"Logs" isDirectory:YES]
@@ -573,7 +573,7 @@ static void pruneLogs(NSURL *directory, NSURL *protectedURL) {
 static void persistDirtyTrace(void) {
     if (gAutomaticLogURL == nil ||
         !atomic_exchange(&gLoggingDirty, false)) return;
-    NSData *data = [traceText(@"automatic") dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *data = [TDGestureEngineDiagnosticText(@"automatic") dataUsingEncoding:NSUTF8StringEncoding];
     if (data == nil || ![data writeToURL:gAutomaticLogURL options:NSDataWritingAtomic error:nil]) {
         atomic_store(&gLoggingFaulted, true);
         atomic_store(&gLoggingDirty, true);
@@ -586,7 +586,7 @@ static void persistDirtyTrace(void) {
 static void startLogging(void) {
     if (atomic_exchange(&gLoggingActive, true)) return;
     atomic_store(&gLoggingFaulted, false);
-    NSURL *directory = logDirectoryURL();
+    NSURL *directory = TDGestureEngineDiagnosticDirectoryURL();
     [[NSFileManager defaultManager] createDirectoryAtURL:directory withIntermediateDirectories:YES
                                                attributes:@{NSFilePosixPermissions: @(0700)} error:nil];
     gAutomaticLogURL = [directory URLByAppendingPathComponent:[NSString stringWithFormat:
@@ -642,7 +642,7 @@ static BOOL replacementActive(TDMTDeviceRef device) {
         !nativeDraggingForDevice(device);
 }
 
-static BOOL shouldUseMultitouchDevice(TDMTDeviceRef device) {
+BOOL TDGestureEngineShouldUseMultitouchDevice(TDMTDeviceRef device) {
     // Device lists can include small surfaces such as Touch Bar. Preserve a
     // device when the private dimension query itself is unavailable or fails.
     if (!gDeviceGetSensorDimensions) return YES;
@@ -962,10 +962,10 @@ static void flushBufferedTapLocked(void) {
         return;
     }
     CGPoint pointer = CGPointZero;
-    BOOL restore = gBufferedTapUp && copyPointerLocation(&pointer) &&
+    BOOL restore = copyPointerLocation(&pointer) &&
         locationsDiffer(pointer, CGEventGetLocation(gBufferedTapUp));
-    if (gBufferedTapDown) postBufferedButtonLocked(gBufferedTapDown);
-    if (gBufferedTapUp) postBufferedButtonLocked(gBufferedTapUp);
+    postBufferedButtonLocked(gBufferedTapDown);
+    postBufferedButtonLocked(gBufferedTapUp);
     if (restore) {
         CGEventRef move = createTaggedEvent(kCGEventMouseMoved, pointer, 0);
         if (move) { CGEventPost(InputTapLocation, move); CFRelease(move); }
@@ -1260,14 +1260,12 @@ static BOOL postNativeMovementAsDrag(CGEventRef event, ChainSnapshot snapshot) {
     return drag != NULL;
 }
 
-static BOOL activeEventTapsValid(void);
-
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context) {
     (void)proxy; (void)context;
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
         TDGestureEngineSuspendInput(TDInputResetEventTapDisabled);
         if (gEventTap) CGEventTapEnable(gEventTap, true);
-        if (activeEventTapsValid()) TDGestureEngineResumeInput();
+        if (TDGestureEngineEventTapsValid()) TDGestureEngineResumeInput();
         return event;
     }
     if (event == NULL || ownEvent(event) || !atomic_load(&gEnabled)) return event;
@@ -1309,7 +1307,7 @@ static CGEventRef clickBufferCallback(CGEventTapProxy proxy, CGEventType type,
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
         TDGestureEngineSuspendInput(TDInputResetEventTapDisabled);
         if (gClickTap) CGEventTapEnable(gClickTap, true);
-        if (activeEventTapsValid()) TDGestureEngineResumeInput();
+        if (TDGestureEngineEventTapsValid()) TDGestureEngineResumeInput();
         return event;
     }
     if (!event || ownEvent(event) || !atomic_load(&gEnabled)) return event;
@@ -1377,8 +1375,9 @@ static void completeTouch(DeviceState *s, double timestamp, BOOL *candidate,
     resetCurrentTouch(s);
 }
 
-static int contactFrameCallback(TDMTDeviceRef device, void *contacts, int contactCount,
-                                double timestamp, int frame) {
+int TDGestureEngineContactFrameCallback(TDMTDeviceRef device, void *contacts,
+                                        int contactCount, double timestamp,
+                                        int frame) {
     // This callback only updates raw state while gStateLock is held. Posting and
     // delayed promotion happen after unlock so WindowServer cannot re-enter the
     // callback while the raw device array is locked.
@@ -1405,8 +1404,8 @@ static int contactFrameCallback(TDMTDeviceRef device, void *contacts, int contac
             // An ambiguous identity transition is treated as an explicit end
             // followed by a fresh frame, using recursion only after unlocking.
             observeBreak(s, contacts, contactCount); os_unfair_lock_unlock(&gStateLock);
-            contactFrameCallback(device, NULL, 0, timestamp, frame);
-            return contactFrameCallback(device, contacts, contactCount, timestamp, frame);
+            TDGestureEngineContactFrameCallback(device, NULL, 0, timestamp, frame);
+            return TDGestureEngineContactFrameCallback(device, contacts, contactCount, timestamp, frame);
         }
     }
     if (count > 0) {
@@ -1469,7 +1468,7 @@ static int contactFrameCallback(TDMTDeviceRef device, void *contacts, int contac
         else if (candidate) {
             ReleaseRequest request = requestRelease(generation, &number, &releaseLocation);
             if (request == ReleaseCaller) ownedUp = YES;
-            else if (request == ReleaseStarter && !s->startRequested) { schedule = YES; epoch = atomic_load(&gFeatureEpoch); }
+            else if (request == ReleaseStarter) { schedule = YES; epoch = atomic_load(&gFeatureEpoch); }
             else if (request == ReleaseInactive) resetChain(generation, ReasonStale);
         }
     } else resetCurrentTouch(s);
@@ -1492,7 +1491,7 @@ static CGEventMask diagnosticMouseMask(void) {
         CGEventMaskBit(kCGEventTabletPointer) | CGEventMaskBit(kCGEventTabletProximity);
 }
 
-static BOOL activeEventTapsValid(void) {
+BOOL TDGestureEngineEventTapsValid(void) {
     return gEventTap && gEventTapSource && CFMachPortIsValid(gEventTap) &&
         CGEventTapIsEnabled(gEventTap) && gClickTap && gClickTapSource &&
         CFMachPortIsValid(gClickTap) && CGEventTapIsEnabled(gClickTap);
@@ -1552,7 +1551,7 @@ void TDGestureEngineSetEnabled(BOOL enabled) {
     if (enabled) {
         atomic_store(&gInputSuspended,
                      !atomic_load(&gMultitouchReady) ||
-                     !activeEventTapsValid());
+                     !TDGestureEngineEventTapsValid());
     }
     if (enabled && atomic_load(&gAutomaticLoggingEnabled)) {
         startLogging();
@@ -1578,7 +1577,7 @@ BOOL TDGestureEngineResumeInput(void) {
     // Keep the invariant inside the engine: an enabled recognizer cannot open
     // until raw devices and both active filtering taps are operational.
     if (atomic_load(&gEnabled) &&
-        (!atomic_load(&gMultitouchReady) || !activeEventTapsValid())) {
+        (!atomic_load(&gMultitouchReady) || !TDGestureEngineEventTapsValid())) {
         return NO;
     }
     atomic_store(&gInputSuspended, false);
@@ -1714,10 +1713,6 @@ static void removeEventTaps(void) {
     }
 }
 
-BOOL TDGestureEngineEventTapsValid(void) {
-    return activeEventTapsValid();
-}
-
 BOOL TDGestureEngineRefreshDraggingPreferences(void) {
     BOOL changed = refreshDraggingPreferences();
     if (changed) resetEngine(TDInputResetNativeDragging);
@@ -1739,10 +1734,6 @@ void TDGestureEngineConfigureMultitouch(
     gDeviceGetSensorDimensions = sensorDimensions;
 }
 
-BOOL TDGestureEngineShouldUseMultitouchDevice(TDMTDeviceRef device) {
-    return shouldUseMultitouchDevice(device);
-}
-
 void TDGestureEngineSetMultitouchDevices(const TDMTDeviceRef *devices,
                                          size_t count) {
     int deviceCount = devices == NULL
@@ -1756,23 +1747,4 @@ void TDGestureEngineSetMultitouchDevices(const TDMTDeviceRef *devices,
     // The device array and readiness flag are one public state transition.
     atomic_store(&gMultitouchReady, deviceCount > 0);
     os_unfair_lock_unlock(&gStateLock);
-}
-
-int TDGestureEngineContactFrameCallback(TDMTDeviceRef device, void *contacts,
-                                        int contactCount, double timestamp,
-                                        int frame) {
-    return contactFrameCallback(device, contacts, contactCount, timestamp,
-                                frame);
-}
-
-NSString *TDGestureEngineDiagnosticText(NSString *capture) {
-    return traceText(capture);
-}
-
-NSURL *TDGestureEngineDiagnosticDirectoryURL(void) {
-    return logDirectoryURL();
-}
-
-void TDGestureEngineClearDiagnostics(void) {
-    clearRecords();
 }

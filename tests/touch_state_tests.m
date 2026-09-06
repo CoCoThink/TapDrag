@@ -565,12 +565,12 @@ static void testDelayedFirstTapButtons(void) {
         for (int upArrival = 0; upArrival < 3; ++upArrival) {
             gDevices[0] = (DeviceState){.device = device};
             MTTouch first = touch(MTTouchStateMakeTouch, 1, 1, 0.5f, 0.5f);
-            contactFrameCallback(device, &first, 1, 10.0, 1);
-            contactFrameCallback(device, NULL, 0, 10.06, 2);
+            TDGestureEngineContactFrameCallback(device, &first, 1, 10.0, 1);
+            TDGestureEngineContactFrameCallback(device, NULL, 0, 10.06, 2);
             assert(gDevices[0].firstTapPending);
             CGPoint pointer = gDevices[0].firstTapPointer;
             MTTouch second = touch(MTTouchStateMakeTouch, 2, 2, 0.5f, 0.5f);
-            contactFrameCallback(device, &second, 1, 10.12, 3);
+            TDGestureEngineContactFrameCallback(device, &second, 1, 10.12, 3);
             assert(gDevices[0].chainCandidate);
             unsigned long long generation = gDevices[0].chainGeneration;
 
@@ -606,7 +606,7 @@ static void testDelayedFirstTapButtons(void) {
             if (upArrival == 1)
                 assert(callback(NULL, kCGEventLeftMouseUp, up, NULL) == NULL);
 
-            contactFrameCallback(device, NULL, 0, 10.18, 4);
+            TDGestureEngineContactFrameCallback(device, NULL, 0, 10.18, 4);
             assert(chainSnapshot().phase == DragPhaseIdle);
             assert(postedEventCount == 3);
             assert(CGEventGetType(postedEvents[2]) == kCGEventLeftMouseUp);
@@ -728,7 +728,7 @@ static void testSerializedDragTransaction(void) {
 
 static void testDownstreamObserverDoesNotChangeOwnership(void) {
     forceIdle();
-    clearRecords();
+    TDGestureEngineClearDiagnostics();
     atomic_store(&gEnabled, true);
     os_unfair_lock_lock(&gChainLock);
     gChain.generation = 200;
@@ -804,11 +804,11 @@ static int fakeSensorDimensions(TDMTDeviceRef device, int *rows, int *columns) {
 static void testMultitouchDeviceFiltering(void) {
     TDMTDeviceGetSensorDimensionsFunction previous = gDeviceGetSensorDimensions;
     gDeviceGetSensorDimensions = fakeSensorDimensions;
-    assert(!shouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)1));
-    assert(shouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)2));
-    assert(shouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)3));
+    assert(!TDGestureEngineShouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)1));
+    assert(TDGestureEngineShouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)2));
+    assert(TDGestureEngineShouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)3));
     gDeviceGetSensorDimensions = NULL;
-    assert(shouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)1));
+    assert(TDGestureEngineShouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)1));
     gDeviceGetSensorDimensions = previous;
 }
 
@@ -928,7 +928,7 @@ static void testSyntheticEventMetadata(void) {
 }
 
 static void testDiagnosticRing(void) {
-    clearRecords();
+    TDGestureEngineClearDiagnostics();
     recordDiagnostic(DiagnosticSecondContact, ReasonSecondTap, 99,
                      DragPhaseCandidate, NULL, CGPointMake(30, 40),
                      12, 3, 1, NO, NO);
@@ -942,13 +942,13 @@ static void testDiagnosticRing(void) {
     assert(records[0].generation == 99);
     assert(records[0].kind == DiagnosticSecondContact);
     assert(records[1].moved == YES);
-    NSString *text = traceText(@"test");
+    NSString *text = TDGestureEngineDiagnosticText(@"test");
     assert([text containsString:@"\"second_contact\""]);
     assert([text containsString:@"\"movement_confirmed\""]);
     assert([text containsString:@"\"first_click_allowance_ms\":20"]);
     assert([text containsString:@"\"diagnostic_schema\":6"]);
 
-    clearRecords();
+    TDGestureEngineClearDiagnostics();
     for (NSUInteger i = 0; i < DiagnosticCapacity + 3; ++i) {
         recordDiagnostic(DiagnosticMovement, ReasonMovement, i,
                          DragPhaseOwned, NULL, CGPointZero,
