@@ -10,7 +10,10 @@ TapDrag 只负责一件事：在 macOS 原生触控板拖移关闭时，实现�
 
 | 路径 | 用途 |
 | --- | --- |
-| `TapDrag/Sources/main.m` | 菜单、权限、原始触点识别、拖动状态机、event tap、日志。 |
+| `TapDrag/Sources/main.m` | 进程入口。 |
+| `TapDrag/Sources/AppDelegate.{h,m}` | 菜单、权限和 macOS 应用生命周期协调。 |
+| `TapDrag/Sources/MultitouchManager.{h,m}` | 私有框架加载、设备枚举和 IOKit 热插拔。 |
+| `TapDrag/Sources/TapDragEngine.{h,m}` | 应用层接口、触点识别、event tap、合成事务和诊断。 |
 | `TapDrag/Info.plist` | 应用名、版本、Bundle ID 和菜单栏应用配置。 |
 | `TapDrag/Resources/AppIcon.png` | 应用图标源文件。 |
 | `TapDrag/build.sh` | 编译、组装、签名和签名验证。 |
@@ -20,6 +23,8 @@ TapDrag 只负责一件事：在 macOS 原生触控板拖移关闭时，实现�
 | `scripts/create-local-signing-identity.sh` | 一次性创建稳定的本地签名身份。 |
 | `scripts/signing-status.sh` | 检查签名身份和 designated requirement。 |
 | `scripts/package-release.sh` | 生成发布压缩包。 |
+
+模块依赖保持单向：`main.m` 创建 `TDAppDelegate`；应用层协调 `TDMultitouchManager` 与 `TapDragEngine`；设备管理器只把设备能力、设备列表和 raw contact frame 交给引擎。所有手势状态、输入锁、event tap 句柄及合成事件资源均由 `TapDragEngine.m` 独占，应用层不得绕过 `TapDragEngine.h` 访问内部状态。`TDGestureEngineSuspendInput()` 必须在一个操作中关闭输入门、释放事务并重置 raw 状态；`TDGestureEngineSetMultitouchDevices()` 必须同时更新设备数组与就绪状态；`TDGestureEngineResumeInput()` 在功能启用时自行验证设备及两个主动 event tap，调用方不能强行解除暂停。状态机白盒测试直接编译引擎实现，以验证文件内的锁和事务边界，同时用测试事件工厂隔离 WindowServer 的 event-source 生命周期。
 
 ## 3. 运行前提
 
@@ -97,7 +102,7 @@ raw contact 路径：gStateLock -> gChainLock
 
 开启时必须先确认权限并安装 event tap；仅当 `AutomaticDiagnosticLoggingEnabled` 也为真时启动自动日志。不要再增加实验功能开关。
 
-系统睡眠和用户会话失去活动状态时，必须先设置 `gInputSuspended`，再增加 feature epoch、释放已拥有的拖动、丢弃未提交的首击、停止 raw 设备并重置全部设备。挂起期间 `replacementActive()` 必须保持为假。系统唤醒或会话恢复时重新执行 `MTDeviceCreateList`、注册 callback、启动设备并验证 HID 与 annotated-session 两个主动 event tap；全部成功后才能解除 suspended。运行时检查会自动重建意外失效的主动 tap。只读诊断观察器仍是可选项。
+系统睡眠和用户会话失去活动状态时，必须先设置 `gInputSuspended`，再增加 feature epoch、释放已拥有的拖动、丢弃未提交的首击、停止 raw 设备并重置全部设备。挂起期间 `replacementActive()` 必须保持为假。睡眠状态与用户会话状态要分别跟踪：两者任一无效即暂停，只有系统已经唤醒且当前用户会话活跃时才能恢复。成对通知可能描述同一次转换，处理必须幂等，不能重复停止或重建设备。恢复时重新执行 `MTDeviceCreateList`、注册 callback、启动设备并验证 HID 与 annotated-session 两个主动 event tap；全部成功后才能解除 suspended。运行时检查会自动重建意外失效的主动 tap，并在设备枚举短暂失败后继续尝试恢复 raw 设备。只读诊断观察器仍是可选项。
 
 `MTDeviceCreateList` 的结果不只包含触控板。`MTDeviceGetSensorDimensions` 成功时，少于 10 个传感器行的设备应被排除，以免把 Touch Bar 等设备当作拖动输入；查询失败时保留设备以兼容系统 ABI 差异。IOKit 对 `AppleMultitouchDevice` 的新增和移除通知必须持续排空 iterator，并在主 run loop 上停止旧设备、释放旧列表、重新枚举。退出程序时也必须停止设备并释放列表与通知资源。
 
@@ -105,13 +110,7 @@ raw contact 路径：gStateLock -> gChainLock
 
 ### 登录启动
 
-菜单中的 `Launch at Login` 使用 macOS 13 起提供的 `SMAppService.mainAppService` 注册或注销主应用登录项。只在用户操作菜单时修改注册状态，不保存第二份布尔偏好；应用启动及每次打开菜单时读取系统状态。已启用显示勾选，待系统批准显示横线并提供设置入口，未注册或未找到显示未勾选；失败显示系统错误且刷新实际状态。该选项与拖动功能的 `Enabled` 独立，退出应用时不注销登录项。构建和包含 `main.m` 的测试程序均需链接 `ServiceManagement.framework`。接口说明见 [Apple SMAppService](https://developer.apple.com/documentation/servicemanagement/smappservice?language=objc)。
-
-### 首击缓冲
-
-首击缓冲固定采用全局策略，不按目标程序或 PID 分类。只有通过 raw tap、触控 subtype、到达时间、事件坐标和唯一设备联合校验的点击才会进入缓冲。
-
-本程序位于 `CGEventTap` 层，需要重放缓冲事件。普通 tap-to-click 因此会增加约 180 ms 延迟；物理触控板按压、鼠标点击、本工具自身的合成事件以及无法唯一关联的点击必须直接放行。
+菜单中的 `Launch at Login` 使用 macOS 13 起提供的 `SMAppService.mainAppService` 注册或注销主应用登录项。只在用户操作菜单时修改注册状态，不保存第二份布尔偏好；应用启动及每次打开菜单时读取系统状态。已启用显示勾选，待系统批准显示横线并提供设置入口，未注册或未找到显示未勾选；失败显示系统错误且刷新实际状态。该选项与拖动功能的 `Enabled` 独立，退出应用时不注销登录项。应用构建需链接 `ServiceManagement.framework`。接口说明见 [Apple SMAppService](https://developer.apple.com/documentation/servicemanagement/smappservice?language=objc)。
 
 ## 8. 诊断日志
 
@@ -131,7 +130,7 @@ Diagnostics 子菜单中的 `Automatic Logging` 控制自动文件写入，默�
 - native dragging 配置
 - `input_event_tap` 和 `downstream_observer_active` 标明输入层级与观察器状态；`movement_input` 保留改写前事件，`observed_downstream` 记录下游观察，`delta_x/y` 保留移动增量。
 - 当前诊断 schema 6 记录 `event_flags`、`button_number`、`mouse_subtype`、`first_click_allowance_ms` 与首击关联阈值。event tap 回调内不得调用 `CGEventSourceButtonState` 等可能同步等待 WindowServer 的查询，否则回调超时会反过来禁用输入 tap。
-- 首击缓冲使用独立的 annotated-session 主动按钮过滤器和发布队列，不检查目标 PID。它使用 raw lift 时记录的单调时钟和指针位置关联后续事件；过期、距离超限、多个设备同时符合或缺少坐标时均失败放行。约 180 ms 内没有进入第二接触则补发，确认拖动后丢弃首击。单击补发后恢复当前指针位置；真正双击的按钮事件统一发布，避免第二次 down 越过首击补发。
+- 首击缓冲不检查目标 PID。单击补发后恢复当前指针位置，真正双击的按钮事件统一发布，避免第二次 down 越过首击补发。
 - 缓冲及补发与拖动共用 `gSyntheticLock`。该锁内允许取得 `gChainLock`，不得反向取 `gStateLock`。缓冲超时以 token 使旧回调失效；只有 down/up 齐全时才补发，任何中断都不得发布孤立的 down。系统挂起时直接丢弃未提交点击，其余正常取消路径可补发完整点击。缓冲记录为 `native_event_filtered / first_tap`，确认拖动取消首击为 `native_event_filtered / second_tap`，补发为 `native_button_passed / first_tap`。
 
 `synthetic_down/drag/up` 仍表示发布或改写，不是应用接收回执。释放后观察到的事件可能以 generation 0 记录，需用本会话中的 tag、event number 和时间顺序关联；下游观察也不能证明窗口已经移动。

@@ -40,8 +40,15 @@ clang \
   -arch arm64 \
   -fobjc-arc \
   -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Wswitch-enum \
+  -Werror \
   "${COMPILER_FLAGS[@]}" \
   "$ROOT_DIR/Sources/main.m" \
+  "$ROOT_DIR/Sources/AppDelegate.m" \
+  "$ROOT_DIR/Sources/MultitouchManager.m" \
+  "$ROOT_DIR/Sources/TapDragEngine.m" \
   -o "$MACOS_DIR/TapDrag" \
   -framework AppKit \
   -framework ApplicationServices \

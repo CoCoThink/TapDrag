@@ -31,15 +31,13 @@ TapDrag uses Apple's private `MultitouchSupport.framework` to observe raw trackp
 
 Check `Launch at Login` in the menu to start TapDrag automatically when you log in to macOS; uncheck it to disable automatic startup. The menu reflects the current system setting each time it opens. A dash means macOS approval is pending; use `Approve Launch at Login...` to open Login Items settings. This setting is independent of `Enabled`.
 
-TapDrag applies the same first-tap decision window to every uniquely matched raw trackpad tap. This adds roughly 180 ms to ordinary tap-to-click actions. Physical trackpad presses, mouse clicks, and clicks that cannot be uniquely correlated with a raw tap remain immediate.
+TapDrag applies the same first-tap decision window to every uniquely matched raw trackpad tap. This adds roughly 180 ms to ordinary tap-to-click actions. Confirming a drag cancels the buffered first click; otherwise its complete down/up pair is replayed. Physical trackpad presses, mouse clicks, and clicks that cannot be uniquely correlated with a raw tap remain immediate.
 
 The first contact must be a short, stationary tap. The second contact must begin 30–160 ms after the first raw lift. Movement beyond 1.3 mm confirms the drag immediately; a stationary 180 ms hold can also confirm deliberate drag intent. Multi-finger contact invalidates the candidate.
 
-Buffered tap clicks have a roughly 180 ms decision window. Confirming a drag cancels the buffered first click; otherwise the complete down/up pair is replayed. An interrupted or incomplete pair is discarded so TapDrag can never leave the logical button down. Real double-clicks are replayed in order.
-
 The same global path applies in applications, Launchpad, and the Dock. The delay prevents the first tap from selecting content or launching an application before a second contact can turn the gesture into a drag.
 
-TapDrag resets pending contacts and releases any owned drag when macOS sleeps or the user session becomes inactive. On wake or session activation it rebuilds raw multitouch device handles and validates the event taps again. Runtime trackpad connection changes are detected through IOKit. Changes to the macOS trackpad dragging setting are detected while the app is running, without requiring the menu to be opened.
+TapDrag resets pending contacts and releases any owned drag when macOS sleeps or the user session becomes inactive. On wake or session activation it rebuilds raw multitouch device handles and validates the event taps again. Duplicate lifecycle notifications are handled once, and a temporarily unavailable raw device is retried while the app remains active. Runtime trackpad connection changes are detected through IOKit. Changes to the macOS trackpad dragging setting are detected while the app is running, without requiring the menu to be opened.
 
 ## Build
 
@@ -83,7 +81,10 @@ The Diagnostics submenu includes an `Automatic Logging` switch. Turning it off s
 ## Project layout
 
 ```text
-TapDrag/Sources/main.m          Application, gesture state machine, event tap, diagnostics
+TapDrag/Sources/main.m          Process entry point
+TapDrag/Sources/AppDelegate.m   Menu and macOS application lifecycle
+TapDrag/Sources/MultitouchManager.m  Private framework loading and device hotplug
+TapDrag/Sources/TapDragEngine.m Gesture recognition, event taps, transactions, diagnostics
 TapDrag/Info.plist              Bundle metadata and version
 TapDrag/Resources/AppIcon.png   Application icon
 TapDrag/build.sh                Compile, assemble, sign, and verify the app

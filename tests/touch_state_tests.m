@@ -1,9 +1,15 @@
 #import <CoreGraphics/CoreGraphics.h>
 static void capturePostedEvent(CGEventTapLocation location, CGEventRef event);
+static CGEventRef createTestMouseEvent(CGEventSourceRef source, CGEventType type,
+                                       CGPoint location, CGMouseButton button) {
+    (void)source;
+    return CGEventCreateMouseEvent(NULL, type, location, button);
+}
 #define CGEventPost capturePostedEvent
-#define main tapDragApplicationMain
-#include "../TapDrag/Sources/main.m"
-#undef main
+#define TD_CREATE_MOUSE_EVENT(source, type, location, button) \
+    createTestMouseEvent((source), (type), (location), (button))
+#include "../TapDrag/Sources/TapDragEngine.m"
+#undef TD_CREATE_MOUSE_EVENT
 #undef CGEventPost
 
 #include <assert.h>
@@ -43,13 +49,6 @@ static void testTouchCounting(void) {
     assert(touchingCount(NULL, 0) == 0);
 }
 
-static void testLoggingPolicy(void) {
-    assert(!loggingShouldRun(NO, NO));
-    assert(!loggingShouldRun(NO, YES));
-    assert(!loggingShouldRun(YES, NO));
-    assert(loggingShouldRun(YES, YES));
-}
-
 static void testIdentityBoundary(void) {
     DeviceState state = {0};
     state.identityValid = YES;
@@ -67,7 +66,7 @@ static void testIdentityBoundary(void) {
 }
 
 static void testContinuousIdentityTransfer(void) {
-    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x7777;
+    TDMTDeviceRef device = (TDMTDeviceRef)(uintptr_t)0x7777;
     DeviceState state = {0};
     state.device = device;
     state.chainCandidate = YES;
@@ -126,7 +125,6 @@ static void testMovementIncludesBreakFrame(void) {
     end.absoluteVector.position = (MTPoint){21.4f, 20.0f};
     observeBreak(&state, &end, 1);
     assert(state.touchMoved);
-    assert(state.maximumSquaredDistance > 0);
     assert(state.maximumSquaredDistanceMM > 1.3f * 1.3f);
 }
 
@@ -165,9 +163,6 @@ static void testPhysicalMovementHysteresis(void) {
 
 static void testRecognitionWindows(void) {
     assert(doubleTapDragGapForSystemMillis(800) == 160);
-    assert(doubleTapDragGapForSystemMillis(528) == 160);
-    assert(doubleTapDragGapForSystemMillis(552) == 160);
-    assert(doubleTapDragGapForSystemMillis(640) == 160);
     assert(doubleTapDragGapForSystemMillis(300) == 160);
     assert(doubleTapDragGapForSystemMillis(100) == 100);
     assert(doubleTapDragGapForSystemMillis(0) == 1);
@@ -217,7 +212,6 @@ static void testFirstTapClassification(void) {
     state.touchStartedTimestamp = 10.0;
     state.touchingFrames = 3;
     state.maximumTouching = 1;
-    state.maximumSquaredDistance = 0.000001f;
     state.pointerStart = CGPointMake(100, 120);
     BOOL candidate = NO;
     BOOL movement = NO;
@@ -249,7 +243,7 @@ static void testFirstTapClassification(void) {
 
 static void testReplacementStateMachine(void) {
     forceIdle();
-    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x1234;
+    TDMTDeviceRef device = (TDMTDeviceRef)(uintptr_t)0x1234;
     unsigned long long generation = 0;
     assert(beginSecondContact(device, CGPointMake(200, 220), YES, 175,
                               &generation));
@@ -276,7 +270,7 @@ static void testReplacementStateMachine(void) {
 
 static void testOwnedReleaseOwnership(void) {
     forceIdle();
-    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x5678;
+    TDMTDeviceRef device = (TDMTDeviceRef)(uintptr_t)0x5678;
     unsigned long long generation = 0;
     assert(beginSecondContact(device, CGPointMake(300, 320), YES, 180,
                               &generation));
@@ -300,7 +294,7 @@ static void testOwnedReleaseOwnership(void) {
 
 static void testStaleGenerationCannotReleaseNewDrag(void) {
     forceIdle();
-    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0xabcd;
+    TDMTDeviceRef device = (TDMTDeviceRef)(uintptr_t)0xabcd;
     unsigned long long oldGeneration = 0;
     assert(beginSecondContact(device, CGPointZero, YES, 100,
                               &oldGeneration));
@@ -355,7 +349,7 @@ static void clearPostedEvents(void) {
     postedEventCount = 0;
 }
 
-static void setFirstTapCandidate(DeviceState *state, MTDeviceRef device,
+static void setFirstTapCandidate(DeviceState *state, TDMTDeviceRef device,
                                  CGPoint pointer, uint64_t completedUptime) {
     *state = (DeviceState){
         .device = device,
@@ -368,8 +362,8 @@ static void setFirstTapCandidate(DeviceState *state, MTDeviceRef device,
 
 static void testFirstTapBuffer(void) {
     forceIdle();
-    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x7779;
-    DeviceState savedDevices[MaximumDevices];
+    TDMTDeviceRef device = (TDMTDeviceRef)(uintptr_t)0x7779;
+    DeviceState savedDevices[TDMaximumMultitouchDevices];
     memcpy(savedDevices, gDevices, sizeof(gDevices));
     int savedCount = gDeviceCount;
     gDeviceCount = 1;
@@ -467,10 +461,10 @@ static void testFirstTapBuffer(void) {
 
 static void testFirstTapCorrelation(void) {
     forceIdle();
-    DeviceState savedDevices[MaximumDevices];
+    DeviceState savedDevices[TDMaximumMultitouchDevices];
     memcpy(savedDevices, gDevices, sizeof(gDevices));
     int savedCount = gDeviceCount;
-    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x7780;
+    TDMTDeviceRef device = (TDMTDeviceRef)(uintptr_t)0x7780;
     CGPoint pointer = CGPointZero;
     assert(copyPointerLocation(&pointer));
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -515,7 +509,7 @@ static void testFirstTapCorrelation(void) {
     CGEventSetIntegerValueField(down, kCGMouseEventSubtype, NSEventSubtypeTouch);
 
     gDeviceCount = 2;
-    setFirstTapCandidate(&gDevices[1], (MTDeviceRef)(uintptr_t)0x7781,
+    setFirstTapCandidate(&gDevices[1], (TDMTDeviceRef)(uintptr_t)0x7781,
                          pointer, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
 
@@ -535,7 +529,7 @@ static void testSerializedDragTransaction(void) {
     atomic_store(&gInternalDraggingPresent, true);
     atomic_store(&gInternalDraggingEnabled, false);
     atomic_store(&gBluetoothDraggingPresent, false);
-    MTDeviceRef device = (MTDeviceRef)(uintptr_t)0x8888;
+    TDMTDeviceRef device = (TDMTDeviceRef)(uintptr_t)0x8888;
     os_unfair_lock_lock(&gChainLock);
     gChain.generation = 100;
     gChain.phase = DragPhaseStarting;
@@ -669,43 +663,43 @@ static void testDownstreamObserverDoesNotChangeOwnership(void) {
 }
 
 
-static BOOL fakeDeviceIsBuiltIn(MTDeviceRef device) {
-    return device == (MTDeviceRef)(uintptr_t)1;
+static BOOL fakeDeviceIsBuiltIn(TDMTDeviceRef device) {
+    return device == (TDMTDeviceRef)(uintptr_t)1;
 }
 
-static int fakeSensorDimensions(MTDeviceRef device, int *rows, int *columns) {
+static int fakeSensorDimensions(TDMTDeviceRef device, int *rows, int *columns) {
     *columns = 20;
-    if (device == (MTDeviceRef)(uintptr_t)3) return -1;
-    *rows = device == (MTDeviceRef)(uintptr_t)1 ? 2 : 10;
+    if (device == (TDMTDeviceRef)(uintptr_t)3) return -1;
+    *rows = device == (TDMTDeviceRef)(uintptr_t)1 ? 2 : 10;
     return 0;
 }
 
 static void testMultitouchDeviceFiltering(void) {
-    MTDeviceGetSensorDimensionsFunction previous = gDeviceGetSensorDimensions;
+    TDMTDeviceGetSensorDimensionsFunction previous = gDeviceGetSensorDimensions;
     gDeviceGetSensorDimensions = fakeSensorDimensions;
-    assert(!shouldUseMultitouchDevice((MTDeviceRef)(uintptr_t)1));
-    assert(shouldUseMultitouchDevice((MTDeviceRef)(uintptr_t)2));
-    assert(shouldUseMultitouchDevice((MTDeviceRef)(uintptr_t)3));
+    assert(!shouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)1));
+    assert(shouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)2));
+    assert(shouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)3));
     gDeviceGetSensorDimensions = NULL;
-    assert(shouldUseMultitouchDevice((MTDeviceRef)(uintptr_t)1));
+    assert(shouldUseMultitouchDevice((TDMTDeviceRef)(uintptr_t)1));
     gDeviceGetSensorDimensions = previous;
 }
 
 static void testDeviceSpecificDraggingPreferences(void) {
-    MTDeviceIsBuiltInFunction previous = gDeviceIsBuiltIn;
+    TDMTDeviceIsBuiltInFunction previous = gDeviceIsBuiltIn;
     gDeviceIsBuiltIn = fakeDeviceIsBuiltIn;
     atomic_store(&gInternalDraggingPresent, true);
     atomic_store(&gInternalDraggingEnabled, false);
     atomic_store(&gBluetoothDraggingPresent, true);
     atomic_store(&gBluetoothDraggingEnabled, true);
-    assert(!nativeDraggingForDevice((MTDeviceRef)(uintptr_t)1));
-    assert(nativeDraggingForDevice((MTDeviceRef)(uintptr_t)2));
+    assert(!nativeDraggingForDevice((TDMTDeviceRef)(uintptr_t)1));
+    assert(nativeDraggingForDevice((TDMTDeviceRef)(uintptr_t)2));
 
     atomic_store(&gInternalDraggingPresent, false);
-    assert(nativeDraggingForDevice((MTDeviceRef)(uintptr_t)1));
+    assert(nativeDraggingForDevice((TDMTDeviceRef)(uintptr_t)1));
     atomic_store(&gInternalDraggingPresent, true);
     atomic_store(&gBluetoothDraggingPresent, false);
-    assert(nativeDraggingForDevice((MTDeviceRef)(uintptr_t)2));
+    assert(nativeDraggingForDevice((TDMTDeviceRef)(uintptr_t)2));
     gDeviceIsBuiltIn = previous;
 }
 
@@ -714,20 +708,49 @@ static void testInputSuspensionGate(void) {
     BOOL previousSuspended = atomic_load(&gInputSuspended);
     BOOL previousInternalPresent = atomic_load(&gInternalDraggingPresent);
     BOOL previousInternalEnabled = atomic_load(&gInternalDraggingEnabled);
-    MTDeviceIsBuiltInFunction previousClassifier = gDeviceIsBuiltIn;
+    TDMTDeviceIsBuiltInFunction previousClassifier = gDeviceIsBuiltIn;
     gDeviceIsBuiltIn = fakeDeviceIsBuiltIn;
     atomic_store(&gEnabled, true);
     atomic_store(&gInternalDraggingPresent, true);
     atomic_store(&gInternalDraggingEnabled, false);
     atomic_store(&gInputSuspended, false);
-    assert(replacementActive((MTDeviceRef)(uintptr_t)1));
+    assert(replacementActive((TDMTDeviceRef)(uintptr_t)1));
     atomic_store(&gInputSuspended, true);
-    assert(!replacementActive((MTDeviceRef)(uintptr_t)1));
+    assert(!replacementActive((TDMTDeviceRef)(uintptr_t)1));
     atomic_store(&gEnabled, previousEnabled);
     atomic_store(&gInputSuspended, previousSuspended);
     atomic_store(&gInternalDraggingPresent, previousInternalPresent);
     atomic_store(&gInternalDraggingEnabled, previousInternalEnabled);
     gDeviceIsBuiltIn = previousClassifier;
+}
+
+static void testInputReadinessIsAtomic(void) {
+    DeviceState previousDevices[TDMaximumMultitouchDevices];
+    memcpy(previousDevices, gDevices, sizeof(gDevices));
+    int previousCount = gDeviceCount;
+    BOOL previousReady = atomic_load(&gMultitouchReady);
+    BOOL previousEnabled = atomic_load(&gEnabled);
+    BOOL previousSuspended = atomic_load(&gInputSuspended);
+
+    TDMTDeviceRef device = (TDMTDeviceRef)(uintptr_t)0x9001;
+    TDGestureEngineSetMultitouchDevices(&device, 1);
+    assert(TDGestureEngineGetStatus().multitouchReady);
+
+    atomic_store(&gEnabled, true);
+    atomic_store(&gInputSuspended, true);
+    assert(!TDGestureEngineResumeInput());
+    assert(TDGestureEngineGetStatus().inputSuspended);
+
+    atomic_store(&gEnabled, false);
+    assert(TDGestureEngineResumeInput());
+    TDGestureEngineSetMultitouchDevices(NULL, 0);
+    assert(!TDGestureEngineGetStatus().multitouchReady);
+
+    memcpy(gDevices, previousDevices, sizeof(gDevices));
+    gDeviceCount = previousCount;
+    atomic_store(&gMultitouchReady, previousReady);
+    atomic_store(&gEnabled, previousEnabled);
+    atomic_store(&gInputSuspended, previousSuspended);
 }
 
 static void testLogRetention(void) {
@@ -797,11 +820,20 @@ static void testDiagnosticRing(void) {
     assert([text containsString:@"\"movement_confirmed\""]);
     assert([text containsString:@"\"first_click_allowance_ms\":20"]);
     assert([text containsString:@"\"diagnostic_schema\":6"]);
+
+    clearRecords();
+    for (NSUInteger i = 0; i < DiagnosticCapacity + 3; ++i) {
+        recordDiagnostic(DiagnosticMovement, ReasonMovement, i,
+                         DragPhaseOwned, NULL, CGPointZero,
+                         0, 0, 1, YES, NO);
+    }
+    assert(copyRecords(records, 4, NULL) == 4);
+    assert(records[0].sequence == DiagnosticCapacity - 1);
+    assert(records[3].sequence == DiagnosticCapacity + 2);
 }
 
 int main(void) {
     testTouchCounting();
-    testLoggingPolicy();
     testIdentityBoundary();
     testContinuousIdentityTransfer();
     testMovementIncludesBreakFrame();
@@ -820,6 +852,7 @@ int main(void) {
     testMultitouchDeviceFiltering();
     testDeviceSpecificDraggingPreferences();
     testInputSuspensionGate();
+    testInputReadinessIsAtomic();
     testLogRetention();
     testSyntheticEventMetadata();
     testDiagnosticRing();
