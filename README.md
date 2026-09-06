@@ -37,6 +37,8 @@ The first contact must be a short, stationary tap. The second contact must begin
 
 The same global path applies in applications, Launchpad, and the Dock. The delay prevents the first tap from selecting content or launching an application before a second contact can turn the gesture into a drag.
 
+Matched first clicks are intercepted at HID entry, with a shared annotated-session fallback for events generated downstream. This also covers files in expanded Dock folders. A first click that arrives after the second raw contact begins remains eligible for buffering; confirming a drag discards that click and consumes any delayed matching mouse-up.
+
 TapDrag resets pending contacts and releases any owned drag when macOS sleeps or the user session becomes inactive. On wake or session activation it rebuilds raw multitouch device handles and validates the event taps again. Duplicate lifecycle notifications are handled once, and a temporarily unavailable raw device is retried while the app remains active. Runtime trackpad connection changes are detected through IOKit. Changes to the macOS trackpad dragging setting are detected while the app is running, without requiring the menu to be opened.
 
 ## Build

@@ -8,7 +8,10 @@ static CGEventRef createTestMouseEvent(CGEventSourceRef source, CGEventType type
 #define CGEventPost capturePostedEvent
 #define TD_CREATE_MOUSE_EVENT(source, type, location, button) \
     createTestMouseEvent((source), (type), (location), (button))
+// Headless/sandboxed AppKit can return zero for the session's click interval.
+#define TD_SYSTEM_DOUBLE_CLICK_INTERVAL() 0.8
 #include "../TapDrag/Sources/TapDragEngine.m"
+#undef TD_SYSTEM_DOUBLE_CLICK_INTERVAL
 #undef TD_CREATE_MOUSE_EVENT
 #undef CGEventPost
 
@@ -384,8 +387,9 @@ static void testFirstTapBuffer(void) {
     CGEventSetIntegerValueField(down, kCGMouseEventSubtype, NSEventSubtypeTouch);
     CGEventSetIntegerValueField(down, kCGMouseEventNumber, 77);
     CGEventSetIntegerValueField(up, kCGMouseEventNumber, 77);
-    assert(clickBufferCallback(NULL, kCGEventLeftMouseDown, down, NULL) == NULL);
-    assert(clickBufferCallback(NULL, kCGEventLeftMouseUp, up, NULL) == NULL);
+    // Dock must not see the first click before the downstream buffer runs.
+    assert(eventTapCallback(NULL, kCGEventLeftMouseDown, down, NULL) == NULL);
+    assert(eventTapCallback(NULL, kCGEventLeftMouseUp, up, NULL) == NULL);
     assert(postedEventCount == 0);
     unsigned long long token = gBufferedTapToken;
     expireBufferedTap(token);
@@ -393,6 +397,11 @@ static void testFirstTapBuffer(void) {
     assert(CGEventGetType(postedEvents[0]) == kCGEventLeftMouseDown);
     assert(CGEventGetType(postedEvents[1]) == kCGEventLeftMouseUp);
     assert(ownEvent(postedEvents[0]) && ownEvent(postedEvents[1]));
+    for (size_t i = 0; i < postedEventCount; ++i) {
+        CGEventRef event = postedEvents[i];
+        assert(eventTapCallback(NULL, CGEventGetType(event), event, NULL) == event);
+        assert(clickBufferCallback(NULL, CGEventGetType(event), event, NULL) == event);
+    }
     expireBufferedTap(token);
     assert(postedEventCount == 2);
     clearPostedEvents();
@@ -508,10 +517,128 @@ static void testFirstTapCorrelation(void) {
     assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
     CGEventSetIntegerValueField(down, kCGMouseEventSubtype, NSEventSubtypeTouch);
 
+    gDevices[0].touchingCount = gDevices[0].maximumTouching = 1;
+    assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    gDevices[0].chainCandidate = YES;
+    gDevices[0].chainGeneration = 550;
+    gChain = (DragChain){.phase = DragPhaseCandidate, .device = device,
+        .generation = 551};
+    assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    gChain.generation = 550;
+    gDevices[0].touchInvalid = YES;
+    assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    gDevices[0].touchInvalid = NO;
+    gDevices[0].touchingCount = 2;
+    assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    forceIdle();
+    setFirstTapCandidate(&gDevices[0], device, pointer,
+                         clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+
     gDeviceCount = 2;
     setFirstTapCandidate(&gDevices[1], (TDMTDeviceRef)(uintptr_t)0x7781,
                          pointer, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     assert(!bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+
+    CFRelease(down); CFRelease(up); CFRelease(gSyntheticSource);
+    gSyntheticSource = NULL;
+    atomic_store(&gEnabled, false);
+    memcpy(gDevices, savedDevices, sizeof(gDevices));
+    gDeviceCount = savedCount;
+    forceIdle();
+}
+
+static void testDelayedFirstTapButtons(void) {
+    forceIdle();
+    DeviceState savedDevices[TDMaximumMultitouchDevices];
+    memcpy(savedDevices, gDevices, sizeof(gDevices));
+    int savedCount = gDeviceCount;
+    TDMTDeviceRef device = (TDMTDeviceRef)(uintptr_t)0x7782;
+    atomic_store(&gEnabled, true);
+    atomic_store(&gInternalDraggingPresent, true);
+    atomic_store(&gInternalDraggingEnabled, false);
+    atomic_store(&gBluetoothDraggingPresent, false);
+    gSyntheticSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    assert(gSyntheticSource);
+    gDeviceCount = 1;
+
+    for (int downstream = 0; downstream < 2; ++downstream) {
+        for (int upArrival = 0; upArrival < 3; ++upArrival) {
+            gDevices[0] = (DeviceState){.device = device};
+            MTTouch first = touch(MTTouchStateMakeTouch, 1, 1, 0.5f, 0.5f);
+            contactFrameCallback(device, &first, 1, 10.0, 1);
+            contactFrameCallback(device, NULL, 0, 10.06, 2);
+            assert(gDevices[0].firstTapPending);
+            CGPoint pointer = gDevices[0].firstTapPointer;
+            MTTouch second = touch(MTTouchStateMakeTouch, 2, 2, 0.5f, 0.5f);
+            contactFrameCallback(device, &second, 1, 10.12, 3);
+            assert(gDevices[0].chainCandidate);
+            unsigned long long generation = gDevices[0].chainGeneration;
+
+            CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
+                                                     pointer, kCGMouseButtonLeft);
+            CGEventRef up = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
+                                                   pointer, kCGMouseButtonLeft);
+            CGEventSetIntegerValueField(down, kCGMouseEventSubtype, NSEventSubtypeTouch);
+            CGEventSetIntegerValueField(down, kCGMouseEventNumber, 92);
+            CGEventSetIntegerValueField(up, kCGMouseEventNumber, 92);
+            CGEventRef (*callback)(CGEventTapProxy, CGEventType, CGEventRef, void *) =
+                downstream ? clickBufferCallback : eventTapCallback;
+            // The first native down arrives only after the second raw contact.
+            assert(callback(NULL, kCGEventLeftMouseDown, down, NULL) == NULL);
+            assert(!gDevices[0].nativeButtonDownDuringTouch);
+            if (upArrival == 0)
+                assert(callback(NULL, kCGEventLeftMouseUp, up, NULL) == NULL);
+            unsigned long long token = gBufferedTapToken;
+            expireBufferedTap(token);
+            assert(postedEventCount == 0);
+
+            long long notBefore = 0;
+            CGPoint latest = CGPointMake(pointer.x + 30, pointer.y);
+            assert(promoteContact(device, generation, latest, YES,
+                                  ReasonMovement, &notBefore));
+            gDevices[0].movementConfirmed = gDevices[0].startRequested = YES;
+            gChain.downNotBeforeMillis = 0;
+            assert(startSyntheticDrag(device, generation, atomic_load(&gFeatureEpoch)));
+            assert(gBufferedTapDown == NULL);
+            assert(postedEventCount == 2);
+            assert(CGEventGetType(postedEvents[0]) == kCGEventLeftMouseDown);
+            assert(CGEventGetType(postedEvents[1]) == kCGEventLeftMouseDragged);
+            if (upArrival == 1)
+                assert(callback(NULL, kCGEventLeftMouseUp, up, NULL) == NULL);
+
+            contactFrameCallback(device, NULL, 0, 10.18, 4);
+            assert(chainSnapshot().phase == DragPhaseIdle);
+            assert(postedEventCount == 3);
+            assert(CGEventGetType(postedEvents[2]) == kCGEventLeftMouseUp);
+            if (upArrival == 2)
+                assert(callback(NULL, kCGEventLeftMouseUp, up, NULL) == NULL);
+            assert(!gDiscardedTapUpPending);
+            expireBufferedTap(token);
+            assert(postedEventCount == 3);
+            clearPostedEvents();
+            CFRelease(down); CFRelease(up);
+        }
+    }
+
+    // A downstream button that missed the HID ownership check must not end a drag.
+    gChain = (DragChain){.phase = DragPhaseOwned, .generation = 600,
+        .device = device, .eventNumber = 100};
+    CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
+                                             CGPointZero, kCGMouseButtonLeft);
+    CGEventRef up = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
+                                           CGPointZero, kCGMouseButtonLeft);
+    CGEventSetIntegerValueField(down, kCGMouseEventNumber, 93);
+    CGEventSetIntegerValueField(up, kCGMouseEventNumber, 93);
+    assert(clickBufferCallback(NULL, kCGEventLeftMouseDown, down, NULL) == NULL);
+    forceIdle();
+    assert(clickBufferCallback(NULL, kCGEventLeftMouseUp, up, NULL) == NULL);
+    assert(postedEventCount == 0);
+    // A fresh physical press remains immediate, even if an old up never arrived.
+    gDiscardedTapUpPending = YES;
+    gDiscardedTapUpNumber = 93;
+    assert(eventTapCallback(NULL, kCGEventLeftMouseDown, down, NULL) == down);
+    assert(eventTapCallback(NULL, kCGEventLeftMouseUp, up, NULL) == up);
+    assert(!gDiscardedTapUpPending);
 
     CFRelease(down); CFRelease(up); CFRelease(gSyntheticSource);
     gSyntheticSource = NULL;
@@ -847,6 +974,7 @@ int main(void) {
     testNativeEventPolicy();
     testFirstTapBuffer();
     testFirstTapCorrelation();
+    testDelayedFirstTapButtons();
     testSerializedDragTransaction();
     testDownstreamObserverDoesNotChangeOwnership();
     testMultitouchDeviceFiltering();

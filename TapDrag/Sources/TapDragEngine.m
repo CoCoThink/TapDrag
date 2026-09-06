@@ -16,6 +16,10 @@
     CGEventCreateMouseEvent((source), (eventType), (point), (button))
 #endif
 
+#ifndef TD_SYSTEM_DOUBLE_CLICK_INTERVAL
+#define TD_SYSTEM_DOUBLE_CLICK_INTERVAL() [NSEvent doubleClickInterval]
+#endif
+
 // Minimal contact layout for the private MultitouchSupport ABI. It is only used
 // to read frames supplied to the registered callback.
 typedef struct { float x, y; } MTPoint;
@@ -205,6 +209,8 @@ static CGEventRef gBufferedTapDown = NULL, gBufferedTapUp = NULL;
 static TDMTDeviceRef gBufferedTapDevice = NULL;
 static unsigned long long gBufferedTapToken = 0;
 static int64_t gReplayedButtonNumber = 0;
+static BOOL gDiscardedTapUpPending = NO;
+static int64_t gDiscardedTapUpNumber = 0;
 static TDMTDeviceIsBuiltInFunction gDeviceIsBuiltIn = NULL;
 static TDMTDeviceGetSensorDimensionsFunction gDeviceGetSensorDimensions = NULL;
 
@@ -224,8 +230,8 @@ static NSURL *gAutomaticLogURL = nil;
 NSString *const TDEnabledDefaultsKey = @"DoubleTapDragReleaseEnabled";
 NSString *const TDAutomaticLoggingDefaultsKey = @"AutomaticDiagnosticLoggingEnabled";
 
-// Recognition is target-independent. Raw timing establishes tap intent; a
-// later annotated mouse event is correlated only to buffer the native click.
+// Recognition is target-independent. Raw timing establishes tap intent;
+// native mouse events are correlated at HID, with an annotated-session fallback.
 static const int64_t DoubleTapTag = 0x3346444E45574452LL;
 static const long long MinimumSecondContactGapMillis = 30;
 static const long long MaximumSecondTapGapMillis = 160;
@@ -245,7 +251,7 @@ static long long nowMillis(void) {
 }
 
 static long long doubleClickIntervalMillis(void) {
-    return MAX(1LL, (long long)([NSEvent doubleClickInterval] * 1000.0));
+    return MAX(1LL, (long long)(TD_SYSTEM_DOUBLE_CLICK_INTERVAL() * 1000.0));
 }
 
 static long long doubleTapDragGapForSystemMillis(long long systemInterval) {
@@ -511,6 +517,7 @@ static NSString *traceText(NSString *capture) {
         @"build": [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"unknown",
         @"records": @(count), @"dropped": @(dropped),
         @"input_event_tap": @"hid",
+        @"first_tap_buffer_taps": @[@"hid", @"annotated_session"],
         @"drag_delivery": @"serialized_hid_post",
         @"synthetic_mouse_subtype": @(NSEventSubtypeTouch),
         @"downstream_observer_active": @(atomic_load(&gObserverActive)),
@@ -857,7 +864,7 @@ static BOOL beginSecondContact(TDMTDeviceRef device, CGPoint start, BOOL valid,
     os_unfair_lock_lock(&gChainLock); BOOL accepted = gChain.phase == DragPhaseIdle;
     if (accepted) {
         // Give WindowServer's native first click time to reach the independent
-        // annotated-session click buffer before synthetic down is posted.
+        // click buffer before synthetic down is posted.
         gChain.generation++; gChain.phase = DragPhaseCandidate; gChain.device = device;
         gChain.eventNumber = 0; gChain.downNotBeforeMillis = nowMillis() + FirstClickAllowanceMillis;
         gChain.start = gChain.latest = start;
@@ -983,9 +990,20 @@ static void expireBufferedTap(unsigned long long token) {
 static BOOL firstTapCandidateMatchesEvent(const DeviceState *state,
                                           CGEventRef event,
                                           uint64_t now) {
-    if (!state->firstTapPending || state->touchingCount != 0 ||
+    if (!state->firstTapPending ||
         !state->firstTapPointerValid || state->firstTapCompletedUptime == 0 ||
         now < state->firstTapCompletedUptime) return NO;
+    if (state->touchingCount != 0) {
+        // Raw frames can begin the second contact before the first native click
+        // reaches either tap. It still belongs to the completed first contact.
+        ChainSnapshot chain = chainSnapshot();
+        if (state->touchingCount != 1 || state->maximumTouching != 1 ||
+            state->touchInvalid || !state->chainCandidate ||
+            chain.device != state->device ||
+            chain.generation != state->chainGeneration ||
+            (chain.phase != DragPhaseCandidate && chain.phase != DragPhaseStarting))
+            return NO;
+    }
     uint64_t maximumAge = (uint64_t)(doubleTapDragGapMillis() +
         FirstClickAllowanceMillis) * NSEC_PER_MSEC;
     if (now - state->firstTapCompletedUptime > maximumAge) return NO;
@@ -1016,7 +1034,23 @@ static BOOL bufferTrackpadTapButton(CGEventType type, CGEventRef event) {
     os_unfair_lock_lock(&gSyntheticLock);
     int64_t number = CGEventGetIntegerValueField(event, kCGMouseEventNumber);
     BOOL consumed = NO;
-    if (gReplayedButtonNumber && type == kCGEventLeftMouseUp && number == gReplayedButtonNumber) {
+    ChainSnapshot chain = chainSnapshot();
+    BOOL owned = chain.phase == DragPhaseOwned ||
+        (chain.phase == DragPhaseReleasing && chain.eventNumber > 0);
+    if (type == kCGEventLeftMouseDown) gDiscardedTapUpPending = NO;
+    if (type == kCGEventLeftMouseUp && gDiscardedTapUpPending &&
+        number == gDiscardedTapUpNumber) {
+        gDiscardedTapUpPending = NO;
+        consumed = YES;
+    } else if (owned) {
+        // Buttons already in flight can arrive downstream after synthetic down.
+        // Serialize this check with drag startup so they cannot release it.
+        if (type == kCGEventLeftMouseDown) {
+            gDiscardedTapUpPending = YES;
+            gDiscardedTapUpNumber = number;
+        }
+        consumed = YES;
+    } else if (gReplayedButtonNumber && type == kCGEventLeftMouseUp && number == gReplayedButtonNumber) {
         postBufferedButtonLocked(event);
         gReplayedButtonNumber = 0;
         consumed = YES;
@@ -1044,8 +1078,9 @@ static BOOL bufferTrackpadTapButton(CGEventType type, CGEventRef event) {
             consumed = YES;
         }
     }
-    if (consumed) recordDiagnostic(DiagnosticNativeFiltered, ReasonFirstTap, 0,
-        chainSnapshot().phase, event, CGEventGetLocation(event), 0, 0, 0, NO, NO);
+    if (consumed) recordDiagnostic(DiagnosticNativeFiltered,
+        owned ? ReasonSecondTap : ReasonFirstTap, chain.generation,
+        chain.phase, event, CGEventGetLocation(event), 0, 0, 0, NO, NO);
     os_unfair_lock_unlock(&gSyntheticLock);
     return consumed;
 }
@@ -1091,6 +1126,11 @@ static BOOL startSyntheticDrag(TDMTDeviceRef device, unsigned long long generati
     if (gBufferedTapDevice == device) {
         recordDiagnostic(DiagnosticNativeFiltered, ReasonSecondTap, generation, gChain.phase,
             gBufferedTapDown, start, 0, 0, 0, YES, NO);
+        if (gBufferedTapDown && !gBufferedTapUp) {
+            gDiscardedTapUpPending = YES;
+            gDiscardedTapUpNumber = CGEventGetIntegerValueField(
+                gBufferedTapDown, kCGMouseEventNumber);
+        }
         discardBufferedTapLocked();
     }
     recordDiagnostic(DiagnosticSyntheticDown, ReasonSecondTap, generation,
@@ -1163,6 +1203,7 @@ static void interruptChain(DiagnosticReason reason) {
         discardBufferedTapLocked();
     else flushBufferedTapLocked();
     gReplayedButtonNumber = 0;
+    gDiscardedTapUpPending = NO;
     os_unfair_lock_unlock(&gSyntheticLock);
 }
 
@@ -1239,6 +1280,9 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
             marked > 0 ? ReasonNativeButtonDuringTouch : ReasonNone,
             observed.generation, observed.phase, event, CGEventGetLocation(event),
             0, 0, marked, NO, NO);
+        // Intercept before WindowServer/session consumers can act on the click.
+        // Events generated later in the pipeline use the same downstream buffer.
+        if (bufferTrackpadTapButton(type, event)) return NULL;
     }
     ChainSnapshot s = chainSnapshot();
     NativeDisposition disposition = dispositionForEvent(s, type);
@@ -1580,8 +1624,8 @@ BOOL TDGestureEngineInstallEventTaps(void) {
     CFRunLoopAddSource(CFRunLoopGetMain(), gEventTapSource,
                        kCFRunLoopCommonModes);
 
-    // WindowServer emits tap-to-click at annotated-session level. Buffer only
-    // buttons correlated with a completed raw single-finger tap.
+    // Some tap-to-click events first appear downstream. Share the HID buffer,
+    // including ownership checks for native buttons already in flight.
     gClickTap = CGEventTapCreate(kCGAnnotatedSessionEventTap,
         kCGHeadInsertEventTap, kCGEventTapOptionDefault,
         CGEventMaskBit(kCGEventLeftMouseDown) |

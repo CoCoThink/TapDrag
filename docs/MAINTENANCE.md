@@ -40,8 +40,8 @@ TapDrag 只负责一件事：在 macOS 原生触控板拖移关闭时，实现�
 输入处理包括：
 
 - `MultitouchSupport.framework` 的 raw contact frame，决定真实接触开始、移动、身份变化和抬起。
-- HID event tap 的鼠标事件，在应用拥有拖动事务后过滤冲突事件。拥有事务时消费原生 movement，将替代拖动与 down/up 在同一锁保护下从 HID 发布。
-- annotated-session 主动按钮过滤器对所有与唯一 raw 单指 tap 在时间和坐标上匹配的触控子类型点击执行首击缓冲。确认拖动时取消首击，否则补发普通点击。
+- HID event tap 对与唯一 raw 单指 tap 在时间和坐标上匹配的触控子类型点击执行首击缓冲，在事件进入 WindowServer 时阻止首击提前生效。拥有事务时消费原生 movement，将替代拖动与 down/up 在同一锁保护下从 HID 发布。
+- annotated-session 主动按钮过滤器作为下游生成事件的兜底，与 HID 共用首击缓冲及事务所有权检查。确认拖动时取消首击，否则补发普通点击。不能只在 annotated-session 缓冲而从 HID 放行匹配的首击；Dock 文件夹弹出内容也必须走这条统一路径。各拦截层的位置见 [Apple CGEventTapLocation](https://developer.apple.com/documentation/coregraphics/cgeventtaplocation?language=objc)。
 - annotated-session 层的只读观察器仅记录下游事件，不参与拖动状态迁移；观察器失效不能中断拖动。
 
 输出是一条带 `DoubleTapTag` 的完整事务：
@@ -61,7 +61,7 @@ leftMouseDown -> leftMouseDragged* -> leftMouseUp
 - 第二次接触保持 180 ms 也可确认拖动意图。
 - 任意多指接触使候选失效。
 - 物理按压产生的 native mouse-down 若发生在第一次接触尚未结束时，不得成为首击候选。
-- 首击缓冲要求 annotated-session 的 `leftMouseDown` 为 `NSEventSubtypeTouch`，并在首击决策窗口内到达，事件坐标与 raw lift 时指针相距不超过 12 points；必须恰好匹配一个设备。任一条件不确定时直接放行。
+- 首击缓冲要求 HID 或 annotated-session 的 `leftMouseDown` 为 `NSEventSubtypeTouch`，并在首击决策窗口内到达，事件坐标与 raw lift 时指针相距不超过 12 points；必须恰好匹配一个设备。第二次 raw 接触已开始时，只要仍为同设备、同 generation 的有效单指 `Candidate` 或 `Starting`，迟到的首击仍可匹配。其余接触中、多指、失效候选或歧义输入直接放行。
 - 驱动在连续单指接触期间更换 contact identity 时，应转移身份，不能误判为抬手。该规则覆盖首击、`Candidate`、`Starting` 和 `Owned`；只有真正出现零接触帧才构成 raw lift。
 
 这些数字来自已有真实日志的误触与漏识别分界。调整前必须保存对照日志并补充测试。
@@ -131,6 +131,7 @@ Diagnostics 子菜单中的 `Automatic Logging` 控制自动文件写入，默�
 - `input_event_tap` 和 `downstream_observer_active` 标明输入层级与观察器状态；`movement_input` 保留改写前事件，`observed_downstream` 记录下游观察，`delta_x/y` 保留移动增量。
 - 当前诊断 schema 6 记录 `event_flags`、`button_number`、`mouse_subtype`、`first_click_allowance_ms` 与首击关联阈值。event tap 回调内不得调用 `CGEventSourceButtonState` 等可能同步等待 WindowServer 的查询，否则回调超时会反过来禁用输入 tap。
 - 首击缓冲不检查目标 PID。单击补发后恢复当前指针位置，真正双击的按钮事件统一发布，避免第二次 down 越过首击补发。
+- 日志头的 `first_tap_buffer_taps` 标识 HID 与 annotated-session 共用缓冲。两个层级都在 `gSyntheticLock` 内检查拖动所有权，拦截已在途的原生按钮。取消尚未收齐 up 的首击时保留其 event number，消费迟到的对应 up，即使此时合成拖动已经结束；新的原生 down 或输入重置清除此记录，避免事件编号复用误吞后续点击。
 - 缓冲及补发与拖动共用 `gSyntheticLock`。该锁内允许取得 `gChainLock`，不得反向取 `gStateLock`。缓冲超时以 token 使旧回调失效；只有 down/up 齐全时才补发，任何中断都不得发布孤立的 down。系统挂起时直接丢弃未提交点击，其余正常取消路径可补发完整点击。缓冲记录为 `native_event_filtered / first_tap`，确认拖动取消首击为 `native_event_filtered / second_tap`，补发为 `native_button_passed / first_tap`。
 
 `synthetic_down/drag/up` 仍表示发布或改写，不是应用接收回执。释放后观察到的事件可能以 generation 0 记录，需用本会话中的 tag、event number 和时间顺序关联；下游观察也不能证明窗口已经移动。
