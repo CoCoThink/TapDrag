@@ -35,9 +35,11 @@ TapDrag applies the same first-tap decision window to every uniquely matched raw
 
 The first contact must be a short, stationary tap. The second contact must begin 30–160 ms after the first raw lift. Movement beyond 1.3 mm confirms the drag immediately; a stationary 180 ms hold can also confirm deliberate drag intent. Multi-finger contact invalidates the candidate.
 
-Buffered tap clicks have a roughly 180 ms decision window. Confirming a drag cancels the buffered first click; otherwise the click is replayed. Real double-clicks are replayed in order.
+Buffered tap clicks have a roughly 180 ms decision window. Confirming a drag cancels the buffered first click; otherwise the complete down/up pair is replayed. An interrupted or incomplete pair is discarded so TapDrag can never leave the logical button down. Real double-clicks are replayed in order.
 
 The same global path applies in applications, Launchpad, and the Dock. The delay prevents the first tap from selecting content or launching an application before a second contact can turn the gesture into a drag.
+
+TapDrag resets pending contacts and releases any owned drag when macOS sleeps or the user session becomes inactive. On wake or session activation it rebuilds raw multitouch device handles and validates the event taps again. Runtime trackpad connection changes are detected through IOKit. Changes to the macOS trackpad dragging setting are detected while the app is running, without requiring the menu to be opened.
 
 ## Build
 
@@ -64,6 +66,8 @@ make signing-status
 make release
 ```
 
+Release testing that requires real macOS UI, session changes, or trackpad hardware is listed in [the manual testing checklist](docs/MANUAL_TESTING.md).
+
 For Apple-issued signing, set `TAPDRAG_CODESIGN_IDENTITY`. For release packaging, set `TAPDRAG_RELEASE_CODESIGN_IDENTITY`.
 
 ## Diagnostics
@@ -86,6 +90,7 @@ TapDrag/build.sh                Compile, assemble, sign, and verify the app
 tests/touch_state_tests.m       State-machine regression tests
 scripts/                        Signing, icon generation, and release helpers
 docs/MAINTENANCE.md             Maintainer reference
+docs/MANUAL_TESTING.md          Manual macOS UI, lifecycle, and hardware tests
 ```
 
 ## Credits and license

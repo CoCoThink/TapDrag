@@ -1,6 +1,7 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <IOKit/IOKitLib.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <dispatch/dispatch.h>
@@ -19,7 +20,9 @@ typedef MTDeviceRef (*MTDeviceCreateDefaultFunction)(void);
 typedef CFArrayRef (*MTDeviceCreateListFunction)(void);
 typedef int (*MTRegisterContactFrameCallbackFunction)(MTDeviceRef, MTContactCallbackFunction);
 typedef int (*MTDeviceStartFunction)(MTDeviceRef, int);
+typedef int (*MTDeviceStopFunction)(MTDeviceRef);
 typedef BOOL (*MTDeviceIsBuiltInFunction)(MTDeviceRef);
+typedef int (*MTDeviceGetSensorDimensionsFunction)(MTDeviceRef, int *, int *);
 
 typedef struct { float x, y; } MTPoint;
 typedef struct { MTPoint position, velocity; } MTVector;
@@ -93,6 +96,10 @@ typedef enum {
     ReasonIdentityTransfer,
     ReasonObserverUnavailable,
     ReasonObserverDisabled,
+    ReasonSystemSuspended,
+    ReasonSystemResumed,
+    ReasonDeviceTopology,
+    ReasonMultitouchUnavailable,
 } DiagnosticReason;
 
 typedef enum { NativePass, NativeFilter, NativeReplaceDrag } NativeDisposition;
@@ -143,7 +150,7 @@ typedef struct {
     int64_t wallMillis, eventNumber, sourceUserData;
     int64_t deltaX, deltaY;
     uint64_t eventFlags;
-    int32_t buttonNumber, mouseSubtype, hidLeftDown, sessionLeftDown;
+    int32_t buttonNumber, mouseSubtype;
     int32_t phase, kind, reason, eventType, clickState;
     int32_t sourceState, sourcePid, sourceUid, sourceGid;
     int32_t targetPid, targetWindow, handlingWindow, x, y;
@@ -158,9 +165,12 @@ enum {
     AutomaticLogLimit = 12,
     SyntheticEventNumberMinimum = 1,
     SyntheticEventNumberMaximum = INT16_MAX,
+    MinimumTrackpadSensorRows = 10,
 };
 
 static atomic_bool gEnabled = false;
+static atomic_bool gInputSuspended = false;
+static atomic_bool gMultitouchReady = false;
 static atomic_ullong gFeatureEpoch = 1;
 static atomic_bool gInternalDraggingPresent = false;
 static atomic_bool gInternalDraggingEnabled = true;
@@ -191,6 +201,12 @@ static MTDeviceRef gBufferedTapDevice = NULL;
 static unsigned long long gBufferedTapToken = 0;
 static int64_t gReplayedButtonNumber = 0;
 static MTDeviceIsBuiltInFunction gDeviceIsBuiltIn = NULL;
+static MTDeviceCreateDefaultFunction gDeviceCreateDefault = NULL;
+static MTDeviceCreateListFunction gDeviceCreateList = NULL;
+static MTRegisterContactFrameCallbackFunction gRegisterContactFrameCallback = NULL;
+static MTDeviceStartFunction gDeviceStart = NULL;
+static MTDeviceStopFunction gDeviceStop = NULL;
+static MTDeviceGetSensorDimensionsFunction gDeviceGetSensorDimensions = NULL;
 
 static DiagnosticRecord gRecords[DiagnosticCapacity];
 static uint64_t gRecordSequence = 0;
@@ -345,6 +361,10 @@ static NSString *reasonName(DiagnosticReason reason) {
         case ReasonIdentityTransfer: return @"identity_transfer";
         case ReasonObserverUnavailable: return @"observer_unavailable";
         case ReasonObserverDisabled: return @"observer_disabled";
+        case ReasonSystemSuspended: return @"system_suspended";
+        case ReasonSystemResumed: return @"system_resumed";
+        case ReasonDeviceTopology: return @"device_topology_changed";
+        case ReasonMultitouchUnavailable: return @"multitouch_unavailable";
     }
     return @"unknown";
 }
@@ -371,8 +391,6 @@ static void recordDiagnosticDetails(DiagnosticKind kind, DiagnosticReason reason
         .eventFlags = event == NULL ? 0 : CGEventGetFlags(event),
         .buttonNumber = event == NULL ? -1 : (int32_t)CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber),
         .mouseSubtype = event == NULL ? -1 : (int32_t)CGEventGetIntegerValueField(event, kCGMouseEventSubtype),
-        .hidLeftDown = event == NULL ? -1 : CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonLeft),
-        .sessionLeftDown = event == NULL ? -1 : CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft),
         .targetPid = event == NULL ? 0 : (int32_t)CGEventGetIntegerValueField(
             event, kCGEventTargetUnixProcessID),
         .sourceState = event == NULL ? 0 : (int32_t)CGEventGetIntegerValueField(
@@ -444,7 +462,6 @@ static NSDictionary *recordDictionary(DiagnosticRecord r) {
              @"delta_x": @(r.deltaX), @"delta_y": @(r.deltaY),
              @"event_flags": @(r.eventFlags), @"button_number": @(r.buttonNumber),
              @"mouse_subtype": @(r.mouseSubtype),
-             @"hid_left_down": @(r.hidLeftDown), @"session_left_down": @(r.sessionLeftDown),
              @"source_state_id": @(r.sourceState),
              @"source_pid": @(r.sourcePid),
              @"source_uid": @(r.sourceUid),
@@ -479,7 +496,7 @@ static NSString *traceText(NSString *capture) {
         @"drag_delivery": @"serialized_hid_post",
         @"synthetic_mouse_subtype": @(NSEventSubtypeTouch),
         @"downstream_observer_active": @(atomic_load(&gObserverActive)),
-        @"diagnostic_schema": @5,
+        @"diagnostic_schema": @6,
         @"system_double_click_ms": @(doubleClickIntervalMillis()),
         @"minimum_second_contact_gap_ms": @(MinimumSecondContactGapMillis),
         @"double_tap_drag_gap_ms": @(doubleTapDragGapMillis()),
@@ -506,7 +523,7 @@ static NSURL *logDirectoryURL(void) {
             URLByAppendingPathComponent:@"Diagnostics" isDirectory:YES];
 }
 
-static void pruneLogs(NSURL *directory) {
+static void pruneLogs(NSURL *directory, NSURL *protectedURL) {
     NSArray<NSURL *> *files = [[NSFileManager defaultManager]
         contentsOfDirectoryAtURL:directory includingPropertiesForKeys:@[NSURLContentModificationDateKey]
         options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
@@ -514,6 +531,11 @@ static void pruneLogs(NSURL *directory) {
         (void)_; return [url.lastPathComponent hasPrefix:@"double-tap-"] && [url.pathExtension isEqualToString:@"jsonl"];
     }]];
     files = [files sortedArrayUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) {
+        NSString *protectedPath = protectedURL.URLByStandardizingPath.path;
+        if (protectedPath && [a.URLByStandardizingPath.path isEqualToString:protectedPath])
+            return NSOrderedAscending;
+        if (protectedPath && [b.URLByStandardizingPath.path isEqualToString:protectedPath])
+            return NSOrderedDescending;
         NSDate *ad = nil, *bd = nil;
         [a getResourceValue:&ad forKey:NSURLContentModificationDateKey error:nil];
         [b getResourceValue:&bd forKey:NSURLContentModificationDateKey error:nil];
@@ -544,7 +566,12 @@ static void startLogging(void) {
                                                attributes:@{NSFilePosixPermissions: @(0700)} error:nil];
     gAutomaticLogURL = [directory URLByAppendingPathComponent:[NSString stringWithFormat:
         @"double-tap-%@-pid%d.jsonl", NSUUID.UUID.UUIDString, getpid()]];
-    pruneLogs(directory);
+    if (![[NSData data] writeToURL:gAutomaticLogURL options:NSDataWritingAtomic error:nil])
+        atomic_store(&gLoggingFaulted, true);
+    else
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @(0600)}
+                                        ofItemAtPath:gAutomaticLogURL.path error:nil];
+    pruneLogs(directory, gAutomaticLogURL);
     if (gLoggingQueue == NULL) gLoggingQueue = dispatch_queue_create("io.github.efilo1.TapDrag.logs", DISPATCH_QUEUE_SERIAL);
     gLoggingTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gLoggingQueue);
     dispatch_source_set_timer(gLoggingTimer, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
@@ -577,8 +604,8 @@ static BOOL nativeDraggingForDevice(MTDeviceRef device) {
     BOOL bluetoothPresent = atomic_load(&gBluetoothDraggingPresent);
     if (device != NULL && gDeviceIsBuiltIn != NULL) {
         BOOL builtIn = gDeviceIsBuiltIn(device);
-        if (builtIn && internalPresent) return atomic_load(&gInternalDraggingEnabled);
-        if (!builtIn && bluetoothPresent) return atomic_load(&gBluetoothDraggingEnabled);
+        if (builtIn) return internalPresent ? atomic_load(&gInternalDraggingEnabled) : YES;
+        return bluetoothPresent ? atomic_load(&gBluetoothDraggingEnabled) : YES;
     }
     if (!internalPresent && !bluetoothPresent) return YES;
     return (internalPresent && atomic_load(&gInternalDraggingEnabled)) ||
@@ -586,10 +613,24 @@ static BOOL nativeDraggingForDevice(MTDeviceRef device) {
 }
 
 static BOOL replacementActive(MTDeviceRef device) {
-    return atomic_load(&gEnabled) && !nativeDraggingForDevice(device);
+    return atomic_load(&gEnabled) && !atomic_load(&gInputSuspended) &&
+        !nativeDraggingForDevice(device);
 }
 
-static void refreshDraggingPreferences(void) {
+static BOOL shouldUseMultitouchDevice(MTDeviceRef device) {
+    if (!gDeviceGetSensorDimensions) return YES;
+    int rows = 0, columns = 0;
+    int status = gDeviceGetSensorDimensions(device, &rows, &columns);
+    (void)columns;
+    return status != 0 || rows >= MinimumTrackpadSensorRows;
+}
+
+static BOOL refreshDraggingPreferences(void) {
+    BOOL oldIP = atomic_load(&gInternalDraggingPresent);
+    BOOL oldIE = atomic_load(&gInternalDraggingEnabled);
+    BOOL oldBP = atomic_load(&gBluetoothDraggingPresent);
+    BOOL oldBE = atomic_load(&gBluetoothDraggingEnabled);
+    BOOL oldAny = atomic_load(&gAnyNativeDraggingEnabled);
     BOOL ip = NO, bp = NO;
     BOOL ie = readDraggingPreference(@"com.apple.AppleMultitouchTrackpad", &ip);
     BOOL be = readDraggingPreference(@"com.apple.driver.AppleBluetoothMultitouch.trackpad", &bp);
@@ -601,8 +642,11 @@ static void refreshDraggingPreferences(void) {
     for (int i = 0; i < gDeviceCount; i++) any = any || nativeDraggingForDevice(gDevices[i].device);
     os_unfair_lock_unlock(&gStateLock);
     atomic_store(&gAnyNativeDraggingEnabled, any);
-    recordDiagnostic(DiagnosticConfiguration, any ? ReasonNativeDragging : ReasonNone,
-                     0, DragPhaseIdle, NULL, CGPointZero, 0, 0, 0, NO, NO);
+    BOOL changed = oldIP != ip || oldIE != ie || oldBP != bp || oldBE != be || oldAny != any;
+    if (changed)
+        recordDiagnostic(DiagnosticConfiguration, any ? ReasonNativeDragging : ReasonNone,
+                         0, DragPhaseIdle, NULL, CGPointZero, 0, 0, 0, NO, NO);
+    return changed;
 }
 
 static DeviceState *deviceStateLocked(MTDeviceRef device) {
@@ -715,7 +759,12 @@ static void observePosition(DeviceState *s, MTPoint position, MTPoint absolutePo
     float mmX = absolutePosition.x - s->touchStartedAbsolutePosition.x;
     float mmY = absolutePosition.y - s->touchStartedAbsolutePosition.y;
     float distanceMM = mmX * mmX + mmY * mmY;
-    if (isfinite(distanceMM)) {
+    BOOL absoluteValid = isfinite(s->touchStartedAbsolutePosition.x) &&
+        isfinite(s->touchStartedAbsolutePosition.y) && isfinite(absolutePosition.x) &&
+        isfinite(absolutePosition.y) &&
+        ((s->touchStartedAbsolutePosition.x != 0 || s->touchStartedAbsolutePosition.y != 0) &&
+         (absolutePosition.x != 0 || absolutePosition.y != 0));
+    if (absoluteValid && isfinite(distanceMM)) {
         s->maximumSquaredDistanceMM = MAX(s->maximumSquaredDistanceMM, distanceMM);
         if (distanceMM >= TapMoveThresholdMillimeters * TapMoveThresholdMillimeters)
             s->touchMoved = YES;
@@ -876,6 +925,10 @@ static void postBufferedButtonLocked(CGEventRef original) {
 }
 
 static void flushBufferedTapLocked(void) {
+    if (!gBufferedTapDown || !gBufferedTapUp) {
+        discardBufferedTapLocked();
+        return;
+    }
     CGPoint pointer = CGPointZero;
     BOOL restore = gBufferedTapUp && copyPointerLocation(&pointer) &&
         locationsDiffer(pointer, CGEventGetLocation(gBufferedTapUp));
@@ -1077,7 +1130,9 @@ static void interruptChain(DiagnosticReason reason) {
     os_unfair_lock_unlock(&gChainLock);
     if (up) { postUp(number, location, generation); finishRelease(generation); }
     os_unfair_lock_lock(&gSyntheticLock);
-    flushBufferedTapLocked();
+    if (reason == ReasonSystemSuspended || reason == ReasonSystemResumed)
+        discardBufferedTapLocked();
+    else flushBufferedTapLocked();
     gReplayedButtonNumber = 0;
     os_unfair_lock_unlock(&gSyntheticLock);
 }
@@ -1135,13 +1190,19 @@ static BOOL postNativeMovementAsDrag(CGEventRef event, ChainSnapshot snapshot) {
     return drag != NULL;
 }
 
+static BOOL activeEventTapsValid(void);
+
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context) {
     (void)proxy; (void)context;
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
         ChainSnapshot s = chainSnapshot();
         recordDiagnostic(DiagnosticFailure, ReasonEventTapDisabled, s.generation, s.phase,
                          event, CGPointZero, 0, 0, 0, NO, NO);
-        interruptChain(ReasonEventTapDisabled); if (gEventTap) CGEventTapEnable(gEventTap, true); return event;
+        atomic_store(&gInputSuspended, true);
+        interruptChain(ReasonEventTapDisabled);
+        if (gEventTap) CGEventTapEnable(gEventTap, true);
+        if (activeEventTapsValid()) atomic_store(&gInputSuspended, false);
+        return event;
     }
     if (event == NULL || ownEvent(event) || !atomic_load(&gEnabled)) return event;
     BOOL button = type == kCGEventLeftMouseDown || type == kCGEventLeftMouseUp;
@@ -1173,8 +1234,10 @@ static CGEventRef clickBufferCallback(CGEventTapProxy proxy, CGEventType type,
                                       CGEventRef event, void *context) {
     (void)proxy; (void)context;
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        atomic_store(&gInputSuspended, true);
         interruptChain(ReasonEventTapDisabled);
         if (gClickTap) CGEventTapEnable(gClickTap, true);
+        if (activeEventTapsValid()) atomic_store(&gInputSuspended, false);
         return event;
     }
     if (!event || ownEvent(event) || !atomic_load(&gEnabled)) return event;
@@ -1350,15 +1413,47 @@ static CGEventMask diagnosticMouseMask(void) {
         CGEventMaskBit(kCGEventTabletPointer) | CGEventMaskBit(kCGEventTabletProximity);
 }
 
+static BOOL activeEventTapsValid(void) {
+    return gEventTap && gEventTapSource && CFMachPortIsValid(gEventTap) &&
+        CGEventTapIsEnabled(gEventTap) && gClickTap && gClickTapSource &&
+        CFMachPortIsValid(gClickTap) && CGEventTapIsEnabled(gClickTap);
+}
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property(strong) NSStatusItem *statusItem;
 @property(strong) NSMenuItem *enabledItem;
 @property(strong) NSMenuItem *launchAtLoginItem, *loginApprovalItem;
 @property(strong) NSMenuItem *replacementStatus, *diagnosticStatus, *accessibilityItem;
 @property(strong) NSMenuItem *automaticLoggingItem;
-@property(assign) CFArrayRef deviceList;
+@property(strong) NSTimer *configurationTimer;
+@property(assign) BOOL inputSessionActive;
+@property(strong) NSArray *deviceList;
 @property(assign) void *multitouchHandle;
+@property(assign) IONotificationPortRef hotplugPort;
+@property(assign) io_iterator_t addedTrackpads, removedTrackpads;
+- (BOOL)rebuildMultitouchDevices;
+- (void)resetInputState:(DiagnosticReason)reason;
+- (void)updateStatus;
 @end
+
+static void drainDeviceIterator(io_iterator_t iterator) {
+    io_service_t service = IO_OBJECT_NULL;
+    while ((service = IOIteratorNext(iterator)) != IO_OBJECT_NULL) IOObjectRelease(service);
+}
+
+static void multitouchTopologyChanged(void *context, io_iterator_t iterator) {
+    drainDeviceIterator(iterator);
+    AppDelegate *delegate = (__bridge AppDelegate *)context;
+    if (!delegate.inputSessionActive) return;
+    atomic_store(&gInputSuspended, true);
+    [delegate resetInputState:ReasonDeviceTopology];
+    BOOL devicesReady = [delegate rebuildMultitouchDevices];
+    if (!devicesReady) recordDiagnostic(DiagnosticFailure, ReasonMultitouchUnavailable,
+        0, DragPhaseIdle, NULL, CGPointZero, 0, 0, 0, NO, NO);
+    if (!atomic_load(&gEnabled) || (devicesReady && activeEventTapsValid()))
+        atomic_store(&gInputSuspended, false);
+    [delegate updateStatus];
+}
 
 @implementation AppDelegate
 
@@ -1370,7 +1465,16 @@ static CGEventMask diagnosticMouseMask(void) {
 
 - (BOOL)installEventTap {
     if (gSyntheticSource == NULL) return NO;
-    if (gEventTap) { CGEventTapEnable(gEventTap, true); return YES; }
+    if (gEventTap || gEventTapSource || gClickTap || gClickTapSource) {
+        BOOL valid = gEventTap && gEventTapSource && CFMachPortIsValid(gEventTap) &&
+            gClickTap && gClickTapSource && CFMachPortIsValid(gClickTap);
+        if (valid) {
+            CGEventTapEnable(gEventTap, true);
+            CGEventTapEnable(gClickTap, true);
+            if (CGEventTapIsEnabled(gEventTap) && CGEventTapIsEnabled(gClickTap)) return YES;
+        }
+        [self removeEventTap];
+    }
     CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDown) |
         CGEventMaskBit(kCGEventLeftMouseDragged) | CGEventMaskBit(kCGEventLeftMouseUp);
     // Down, drag, up, and conflicting native buttons share this input stage.
@@ -1405,7 +1509,12 @@ static CGEventMask diagnosticMouseMask(void) {
     if (!atomic_load(&gObserverActive))
         recordDiagnostic(DiagnosticFailure, ReasonObserverUnavailable, 0, DragPhaseIdle,
                          NULL, CGPointZero, 0, 0, 0, NO, NO);
-    return YES;
+    if (!gEventTap || !gClickTap) { [self removeEventTap]; return NO; }
+    CGEventTapEnable(gEventTap, true);
+    CGEventTapEnable(gClickTap, true);
+    if (CGEventTapIsEnabled(gEventTap) && CGEventTapIsEnabled(gClickTap)) return YES;
+    [self removeEventTap];
+    return NO;
 }
 
 - (void)removeEventTap {
@@ -1464,9 +1573,13 @@ static CGEventMask diagnosticMouseMask(void) {
             ? @"TapDrag: Disabled"
             : ([self accessStatus:NO] != AccessGranted
                 ? @"TapDrag: Accessibility / Input Monitoring Required"
-                : (atomic_load(&gAnyNativeDraggingEnabled)
+                : (atomic_load(&gInputSuspended)
+                    ? (atomic_load(&gMultitouchReady)
+                        ? @"TapDrag: Paused; event taps unavailable"
+                        : @"TapDrag: Paused; trackpad unavailable")
+                    : (atomic_load(&gAnyNativeDraggingEnabled)
                     ? @"TapDrag: Inactive; turn off macOS trackpad dragging"
-                    : @"TapDrag: Ready"));
+                    : @"TapDrag: Ready")));
     }
     if (self.diagnosticStatus) {
         os_unfair_lock_lock(&gDiagnosticLock); uint64_t count = MIN(gRecordSequence, (uint64_t)DiagnosticCapacity); os_unfair_lock_unlock(&gDiagnosticLock);
@@ -1522,6 +1635,7 @@ static CGEventMask diagnosticMouseMask(void) {
         if ([alert runModal] == NSAlertFirstButtonReturn) [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]]; return;
     }
     atomic_store(&gEnabled, enable);
+    if (enable) atomic_store(&gInputSuspended, !atomic_load(&gMultitouchReady));
     if (loggingShouldRun(enable, atomic_load(&gAutomaticLoggingEnabled))) startLogging();
     else stopLogging();
     if (!enable) { atomic_fetch_add(&gFeatureEpoch, 1); interruptChain(ReasonDisabled); os_unfair_lock_lock(&gStateLock); resetAllDevicesLocked(); os_unfair_lock_unlock(&gStateLock); }
@@ -1547,41 +1661,186 @@ static CGEventMask diagnosticMouseMask(void) {
 - (void)hideStatusItem:(id)sender { (void)sender; if (!self.statusItem) return; [[NSStatusBar systemStatusBar] removeStatusItem:self.statusItem]; self.statusItem = nil; self.enabledItem = nil; self.launchAtLoginItem = self.loginApprovalItem = self.automaticLoggingItem = nil; self.replacementStatus = self.diagnosticStatus = self.accessibilityItem = nil; }
 
 - (void)menuWillOpen:(NSMenu *)menu {
-    if (menu != self.statusItem.menu) return; BOOL old = atomic_load(&gAnyNativeDraggingEnabled); refreshDraggingPreferences();
-    if (old != atomic_load(&gAnyNativeDraggingEnabled)) { atomic_fetch_add(&gFeatureEpoch, 1); interruptChain(ReasonDisabled); os_unfair_lock_lock(&gStateLock); resetAllDevicesLocked(); os_unfair_lock_unlock(&gStateLock); }
+    if (menu != self.statusItem.menu) return; [self refreshRuntimeConfiguration:nil];
     BOOL trusted = AXIsProcessTrusted(); self.accessibilityItem.title = trusted ? @"Accessibility Permission Granted" : @"Accessibility Permission Required"; self.accessibilityItem.state = trusted;
     self.enabledItem.state = atomic_load(&gEnabled); [self updateStatus];
+}
+
+- (void)resetInputState:(DiagnosticReason)reason {
+    atomic_fetch_add(&gFeatureEpoch, 1);
+    interruptChain(reason);
+    os_unfair_lock_lock(&gStateLock);
+    resetAllDevicesLocked();
+    os_unfair_lock_unlock(&gStateLock);
+}
+
+- (void)refreshRuntimeConfiguration:(NSTimer *)timer {
+    (void)timer;
+    BOOL changed = refreshDraggingPreferences();
+    if (changed) [self resetInputState:ReasonNativeDragging];
+    BOOL tapStateChanged = NO;
+    if (self.inputSessionActive && atomic_load(&gEnabled) && !activeEventTapsValid()) {
+        BOOL wasSuspended = atomic_exchange(&gInputSuspended, true);
+        if (!wasSuspended) [self resetInputState:ReasonEventTapDisabled];
+        if (atomic_load(&gMultitouchReady) && [self accessStatus:NO] == AccessGranted &&
+            [self installEventTap]) {
+            atomic_store(&gInputSuspended, false);
+            [self resetInputState:ReasonSystemResumed];
+        }
+        tapStateChanged = wasSuspended != atomic_load(&gInputSuspended);
+    }
+    if (changed || tapStateChanged) [self updateStatus];
+}
+
+- (void)inputWillSuspend:(NSNotification *)notification {
+    (void)notification;
+    self.inputSessionActive = NO;
+    atomic_store(&gInputSuspended, true);
+    [self resetInputState:ReasonSystemSuspended];
+    [self stopMultitouchDevices];
+    [self updateStatus];
+}
+
+- (void)inputDidResume:(NSNotification *)notification {
+    (void)notification;
+    self.inputSessionActive = YES;
+    [self resetInputState:ReasonSystemResumed];
+    BOOL devicesReady = [self rebuildMultitouchDevices];
+    refreshDraggingPreferences();
+    BOOL ready = !atomic_load(&gEnabled) ||
+        (devicesReady && [self accessStatus:NO] == AccessGranted && [self installEventTap]);
+    atomic_store(&gInputSuspended, !ready);
+    if (!ready) recordDiagnostic(DiagnosticFailure, devicesReady
+        ? ReasonEventTapDisabled : ReasonMultitouchUnavailable, 0,
+        DragPhaseIdle, NULL, CGPointZero, 0, 0, 0, NO, NO);
+    [self updateStatus];
+}
+
+- (void)stopMultitouchDevices {
+    atomic_store(&gMultitouchReady, false);
+    NSArray *devices = self.deviceList;
+    if (devices && gDeviceStop) {
+        for (id device in devices) gDeviceStop((__bridge MTDeviceRef)device);
+    }
+    os_unfair_lock_lock(&gStateLock);
+    gDeviceCount = 0;
+    memset(gDevices, 0, sizeof(gDevices));
+    os_unfair_lock_unlock(&gStateLock);
+    self.deviceList = nil;
+}
+
+- (BOOL)rebuildMultitouchDevices {
+    [self stopMultitouchDevices];
+    if (!gRegisterContactFrameCallback || !gDeviceStart) return NO;
+    CFArrayRef discovered = gDeviceCreateList ? gDeviceCreateList() : NULL;
+    CFMutableArrayRef active = CFArrayCreateMutable(kCFAllocatorDefault, 0,
+                                                    &kCFTypeArrayCallBacks);
+    if (!active) { if (discovered) CFRelease(discovered); return NO; }
+    if (discovered) {
+        for (CFIndex i = 0; i < CFArrayGetCount(discovered) &&
+             CFArrayGetCount(active) < MaximumDevices; i++) {
+            MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(discovered, i);
+            if (device && shouldUseMultitouchDevice(device)) CFArrayAppendValue(active, device);
+        }
+        CFRelease(discovered);
+    }
+    if (CFArrayGetCount(active) == 0 && gDeviceCreateDefault) {
+        MTDeviceRef device = gDeviceCreateDefault();
+        if (device) {
+            if (shouldUseMultitouchDevice(device)) CFArrayAppendValue(active, device);
+            CFRelease(device);
+        }
+    }
+    if (CFArrayGetCount(active) == 0) { CFRelease(active); return NO; }
+    self.deviceList = CFBridgingRelease(active);
+    os_unfair_lock_lock(&gStateLock);
+    gDeviceCount = (int)MIN(self.deviceList.count, MaximumDevices);
+    for (int i = 0; i < gDeviceCount; i++) {
+        memset(&gDevices[i], 0, sizeof(DeviceState));
+        gDevices[i].device = (__bridge MTDeviceRef)self.deviceList[i];
+    }
+    os_unfair_lock_unlock(&gStateLock);
+    for (id value in self.deviceList) {
+        MTDeviceRef device = (__bridge MTDeviceRef)value;
+        gRegisterContactFrameCallback(device, contactFrameCallback);
+        gDeviceStart(device, 0);
+    }
+    atomic_store(&gMultitouchReady, true);
+    refreshDraggingPreferences();
+    return YES;
+}
+
+- (void)setupMultitouchHotplug {
+    if (self.hotplugPort) return;
+    self.hotplugPort = IONotificationPortCreate(kIOMainPortDefault);
+    if (!self.hotplugPort) return;
+    CFRunLoopSourceRef source = IONotificationPortGetRunLoopSource(self.hotplugPort);
+    if (source) CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    CFMutableDictionaryRef matching = IOServiceMatching("AppleMultitouchDevice");
+    if (!matching) return;
+    CFRetain(matching);
+    kern_return_t added = IOServiceAddMatchingNotification(self.hotplugPort,
+        kIOFirstMatchNotification, matching, multitouchTopologyChanged,
+        (__bridge void *)self, &_addedTrackpads);
+    kern_return_t removed = IOServiceAddMatchingNotification(self.hotplugPort,
+        kIOTerminatedNotification, matching, multitouchTopologyChanged,
+        (__bridge void *)self, &_removedTrackpads);
+    if (added == KERN_SUCCESS) drainDeviceIterator(self.addedTrackpads);
+    if (removed == KERN_SUCCESS) drainDeviceIterator(self.removedTrackpads);
+}
+
+- (void)teardownMultitouchHotplug {
+    if (self.addedTrackpads) { IOObjectRelease(self.addedTrackpads); self.addedTrackpads = 0; }
+    if (self.removedTrackpads) { IOObjectRelease(self.removedTrackpads); self.removedTrackpads = 0; }
+    if (self.hotplugPort) { IONotificationPortDestroy(self.hotplugPort); self.hotplugPort = NULL; }
 }
 
 - (void)startMultitouch {
     self.multitouchHandle = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/Versions/A/MultitouchSupport", RTLD_LAZY);
     if (!self.multitouchHandle) { self.statusItem.button.image = nil; self.statusItem.button.title = @"TD!"; return; }
-    MTDeviceCreateDefaultFunction createDefault = (MTDeviceCreateDefaultFunction)dlsym(self.multitouchHandle, "MTDeviceCreateDefault");
-    MTDeviceCreateListFunction createList = (MTDeviceCreateListFunction)dlsym(self.multitouchHandle, "MTDeviceCreateList");
-    MTRegisterContactFrameCallbackFunction registerCallback = (MTRegisterContactFrameCallbackFunction)dlsym(self.multitouchHandle, "MTRegisterContactFrameCallback");
-    MTDeviceStartFunction startDevice = (MTDeviceStartFunction)dlsym(self.multitouchHandle, "MTDeviceStart");
+    gDeviceCreateDefault = (MTDeviceCreateDefaultFunction)dlsym(self.multitouchHandle, "MTDeviceCreateDefault");
+    gDeviceCreateList = (MTDeviceCreateListFunction)dlsym(self.multitouchHandle, "MTDeviceCreateList");
+    gRegisterContactFrameCallback = (MTRegisterContactFrameCallbackFunction)dlsym(self.multitouchHandle, "MTRegisterContactFrameCallback");
+    gDeviceStart = (MTDeviceStartFunction)dlsym(self.multitouchHandle, "MTDeviceStart");
+    gDeviceStop = (MTDeviceStopFunction)dlsym(self.multitouchHandle, "MTDeviceStop");
+    gDeviceGetSensorDimensions = (MTDeviceGetSensorDimensionsFunction)dlsym(self.multitouchHandle, "MTDeviceGetSensorDimensions");
     gDeviceIsBuiltIn = (MTDeviceIsBuiltInFunction)dlsym(self.multitouchHandle, "MTDeviceIsBuiltIn");
-    if (!createDefault || !registerCallback || !startDevice) { self.statusItem.button.image = nil; self.statusItem.button.title = @"TD!"; return; }
-    NSMutableArray<NSValue *> *devices = [NSMutableArray array];
-    if (createList) { self.deviceList = createList(); if (self.deviceList) for (CFIndex i = 0; i < CFArrayGetCount(self.deviceList); i++) { MTDeviceRef d = (MTDeviceRef)CFArrayGetValueAtIndex(self.deviceList, i); if (d) [devices addObject:[NSValue valueWithPointer:d]]; } }
-    if (devices.count == 0) { MTDeviceRef d = createDefault(); if (d) [devices addObject:[NSValue valueWithPointer:d]]; }
-    os_unfair_lock_lock(&gStateLock); gDeviceCount = 0;
-    for (NSValue *value in devices) { if (gDeviceCount == MaximumDevices) break; memset(&gDevices[gDeviceCount], 0, sizeof(DeviceState)); gDevices[gDeviceCount++].device = value.pointerValue; }
-    os_unfair_lock_unlock(&gStateLock); refreshDraggingPreferences();
-    for (NSValue *value in devices) { registerCallback(value.pointerValue, contactFrameCallback); startDevice(value.pointerValue, 0); }
+    if ((!gDeviceCreateList && !gDeviceCreateDefault) || !gRegisterContactFrameCallback ||
+        !gDeviceStart || !gDeviceStop) {
+        self.statusItem.button.image = nil; self.statusItem.button.title = @"TD!"; return;
+    }
+    BOOL ready = [self rebuildMultitouchDevices];
+    if (!ready) recordDiagnostic(DiagnosticFailure, ReasonMultitouchUnavailable,
+        0, DragPhaseIdle, NULL, CGPointZero, 0, 0, 0, NO, NO);
+    atomic_store(&gInputSuspended, atomic_load(&gEnabled) && !ready);
+    [self setupMultitouchHotplug];
+    [self updateStatus];
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification; [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         EnabledKey:@YES, AutomaticLoggingKey:@YES}];
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    self.inputSessionActive = YES;
     atomic_store(&gAutomaticLoggingEnabled, [d boolForKey:AutomaticLoggingKey]);
     gNextEventNumber = SyntheticEventNumberMinimum + arc4random_uniform(SyntheticEventNumberMaximum); gSyntheticSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState); if (gSyntheticSource) CGEventSourceSetLocalEventsSuppressionInterval(gSyntheticSource, 0);
     refreshDraggingPreferences(); if ([d boolForKey:EnabledKey] && [self accessStatus:NO] == AccessGranted && [self installEventTap]) { atomic_store(&gEnabled, true); if (atomic_load(&gAutomaticLoggingEnabled)) startLogging(); }
     [self setupStatusItem]; [self startMultitouch];
+    NSNotificationCenter *workspaceNotifications = NSWorkspace.sharedWorkspace.notificationCenter;
+    [workspaceNotifications addObserver:self selector:@selector(inputWillSuspend:)
+                                   name:NSWorkspaceWillSleepNotification object:nil];
+    [workspaceNotifications addObserver:self selector:@selector(inputDidResume:)
+                                   name:NSWorkspaceDidWakeNotification object:nil];
+    [workspaceNotifications addObserver:self selector:@selector(inputWillSuspend:)
+                                   name:NSWorkspaceSessionDidResignActiveNotification object:nil];
+    [workspaceNotifications addObserver:self selector:@selector(inputDidResume:)
+                                   name:NSWorkspaceSessionDidBecomeActiveNotification object:nil];
+    self.configurationTimer = [NSTimer timerWithTimeInterval:1.0 target:self
+        selector:@selector(refreshRuntimeConfiguration:) userInfo:nil repeats:YES];
+    [NSRunLoop.mainRunLoop addTimer:self.configurationTimer forMode:NSRunLoopCommonModes];
 }
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag { (void)sender; (void)flag; [self setupStatusItem]; return NO; }
-- (void)applicationWillTerminate:(NSNotification *)notification { (void)notification; atomic_store(&gEnabled, false); atomic_fetch_add(&gFeatureEpoch, 1); interruptChain(ReasonDisabled); stopLogging(); [self removeEventTap]; if (gSyntheticSource) { CFRelease(gSyntheticSource); gSyntheticSource = NULL; } self.deviceList = NULL; self.multitouchHandle = NULL; }
+- (void)applicationWillTerminate:(NSNotification *)notification { (void)notification; [self.configurationTimer invalidate]; self.configurationTimer = nil; [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self]; atomic_store(&gEnabled, false); atomic_fetch_add(&gFeatureEpoch, 1); interruptChain(ReasonDisabled); stopLogging(); [self removeEventTap]; [self teardownMultitouchHotplug]; [self stopMultitouchDevices]; if (gSyntheticSource) { CFRelease(gSyntheticSource); gSyntheticSource = NULL; } if (self.multitouchHandle) dlclose(self.multitouchHandle); self.multitouchHandle = NULL; }
 @end
 
 int main(int argc, const char *argv[]) {

@@ -45,6 +45,7 @@ clang \
   -o "$MACOS_DIR/TapDrag" \
   -framework AppKit \
   -framework ApplicationServices \
+  -framework IOKit \
   -framework ServiceManagement \
   -framework UniformTypeIdentifiers
 

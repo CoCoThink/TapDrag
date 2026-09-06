@@ -28,6 +28,7 @@ test:
 	clang -fobjc-arc -Wall -Wextra -Wswitch-enum -Werror \
 		tests/touch_state_tests.m -o "$(TEST_BINARY)" \
 		-framework AppKit -framework ApplicationServices \
+		-framework IOKit \
 		-framework ServiceManagement \
 		-framework UniformTypeIdentifiers
 	"$(TEST_BINARY)"

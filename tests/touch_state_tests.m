@@ -155,6 +155,12 @@ static void testPhysicalMovementHysteresis(void) {
                     (MTPoint){NAN, NAN});
     assert(fallback.touchMoved);
 
+    DeviceState zeroAbsolute = {0};
+    zeroAbsolute.touchStartedPosition = (MTPoint){0.5f, 0.5f};
+    zeroAbsolute.touchStartedAbsolutePosition = (MTPoint){0, 0};
+    observePosition(&zeroAbsolute, (MTPoint){0.52f, 0.5f},
+                    (MTPoint){0, 0});
+    assert(zeroAbsolute.touchMoved);
 }
 
 static void testRecognitionWindows(void) {
@@ -397,6 +403,15 @@ static void testFirstTapBuffer(void) {
     assert(postedEventCount == 2);
     clearPostedEvents();
 
+    setFirstTapCandidate(&gDevices[0], device, pointer,
+                         clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    CGEventSetIntegerValueField(down, kCGMouseEventNumber, 76);
+    assert(bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
+    interruptChain(ReasonDisabled);
+    assert(gBufferedTapDown == NULL);
+    assert(postedEventCount == 0);
+
+    CGEventSetIntegerValueField(down, kCGMouseEventNumber, 77);
     assert(bufferTrackpadTapButton(kCGEventLeftMouseDown, down));
     assert(bufferTrackpadTapButton(kCGEventLeftMouseUp, up));
     CGEventSetIntegerValueField(down, kCGMouseEventNumber, 78);
@@ -658,6 +673,24 @@ static BOOL fakeDeviceIsBuiltIn(MTDeviceRef device) {
     return device == (MTDeviceRef)(uintptr_t)1;
 }
 
+static int fakeSensorDimensions(MTDeviceRef device, int *rows, int *columns) {
+    *columns = 20;
+    if (device == (MTDeviceRef)(uintptr_t)3) return -1;
+    *rows = device == (MTDeviceRef)(uintptr_t)1 ? 2 : 10;
+    return 0;
+}
+
+static void testMultitouchDeviceFiltering(void) {
+    MTDeviceGetSensorDimensionsFunction previous = gDeviceGetSensorDimensions;
+    gDeviceGetSensorDimensions = fakeSensorDimensions;
+    assert(!shouldUseMultitouchDevice((MTDeviceRef)(uintptr_t)1));
+    assert(shouldUseMultitouchDevice((MTDeviceRef)(uintptr_t)2));
+    assert(shouldUseMultitouchDevice((MTDeviceRef)(uintptr_t)3));
+    gDeviceGetSensorDimensions = NULL;
+    assert(shouldUseMultitouchDevice((MTDeviceRef)(uintptr_t)1));
+    gDeviceGetSensorDimensions = previous;
+}
+
 static void testDeviceSpecificDraggingPreferences(void) {
     MTDeviceIsBuiltInFunction previous = gDeviceIsBuiltIn;
     gDeviceIsBuiltIn = fakeDeviceIsBuiltIn;
@@ -667,7 +700,55 @@ static void testDeviceSpecificDraggingPreferences(void) {
     atomic_store(&gBluetoothDraggingEnabled, true);
     assert(!nativeDraggingForDevice((MTDeviceRef)(uintptr_t)1));
     assert(nativeDraggingForDevice((MTDeviceRef)(uintptr_t)2));
+
+    atomic_store(&gInternalDraggingPresent, false);
+    assert(nativeDraggingForDevice((MTDeviceRef)(uintptr_t)1));
+    atomic_store(&gInternalDraggingPresent, true);
+    atomic_store(&gBluetoothDraggingPresent, false);
+    assert(nativeDraggingForDevice((MTDeviceRef)(uintptr_t)2));
     gDeviceIsBuiltIn = previous;
+}
+
+static void testInputSuspensionGate(void) {
+    BOOL previousEnabled = atomic_load(&gEnabled);
+    BOOL previousSuspended = atomic_load(&gInputSuspended);
+    BOOL previousInternalPresent = atomic_load(&gInternalDraggingPresent);
+    BOOL previousInternalEnabled = atomic_load(&gInternalDraggingEnabled);
+    MTDeviceIsBuiltInFunction previousClassifier = gDeviceIsBuiltIn;
+    gDeviceIsBuiltIn = fakeDeviceIsBuiltIn;
+    atomic_store(&gEnabled, true);
+    atomic_store(&gInternalDraggingPresent, true);
+    atomic_store(&gInternalDraggingEnabled, false);
+    atomic_store(&gInputSuspended, false);
+    assert(replacementActive((MTDeviceRef)(uintptr_t)1));
+    atomic_store(&gInputSuspended, true);
+    assert(!replacementActive((MTDeviceRef)(uintptr_t)1));
+    atomic_store(&gEnabled, previousEnabled);
+    atomic_store(&gInputSuspended, previousSuspended);
+    atomic_store(&gInternalDraggingPresent, previousInternalPresent);
+    atomic_store(&gInternalDraggingEnabled, previousInternalEnabled);
+    gDeviceIsBuiltIn = previousClassifier;
+}
+
+static void testLogRetention(void) {
+    NSURL *directory = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+        URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    assert([manager createDirectoryAtURL:directory withIntermediateDirectories:YES
+                              attributes:nil error:nil]);
+    NSURL *protectedURL = nil;
+    for (NSUInteger i = 0; i < AutomaticLogLimit + 3; i++) {
+        NSURL *file = [directory URLByAppendingPathComponent:
+            [NSString stringWithFormat:@"double-tap-%02lu.jsonl", (unsigned long)i]];
+        assert([[NSData data] writeToURL:file options:0 error:nil]);
+        if (i == 0) protectedURL = file;
+    }
+    pruneLogs(directory, protectedURL);
+    NSArray<NSURL *> *remaining = [manager contentsOfDirectoryAtURL:directory
+        includingPropertiesForKeys:nil options:0 error:nil];
+    assert(remaining.count == AutomaticLogLimit);
+    assert([manager fileExistsAtPath:protectedURL.path]);
+    assert([manager removeItemAtURL:directory error:nil]);
 }
 
 static void testSyntheticEventMetadata(void) {
@@ -715,7 +796,7 @@ static void testDiagnosticRing(void) {
     assert([text containsString:@"\"second_contact\""]);
     assert([text containsString:@"\"movement_confirmed\""]);
     assert([text containsString:@"\"first_click_allowance_ms\":20"]);
-    assert([text containsString:@"\"diagnostic_schema\":5"]);
+    assert([text containsString:@"\"diagnostic_schema\":6"]);
 }
 
 int main(void) {
@@ -736,7 +817,10 @@ int main(void) {
     testFirstTapCorrelation();
     testSerializedDragTransaction();
     testDownstreamObserverDoesNotChangeOwnership();
+    testMultitouchDeviceFiltering();
     testDeviceSpecificDraggingPreferences();
+    testInputSuspensionGate();
+    testLogRetention();
     testSyntheticEventMetadata();
     testDiagnosticRing();
     return 0;
