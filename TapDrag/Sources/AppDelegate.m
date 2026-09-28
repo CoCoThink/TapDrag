@@ -407,6 +407,13 @@
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
+    // Inspect the launch event here, while AppKit is still handling it.
+    // Login-item registration alone does not mean this launch was automatic.
+    NSAppleEventDescriptor *launchEvent =
+        NSAppleEventManager.sharedAppleEventManager.currentAppleEvent;
+    BOOL launchedAtLogin = launchEvent.eventID == kAEOpenApplication &&
+        [launchEvent paramDescriptorForKeyword:keyAEPropData].enumCodeValue ==
+            keyAELaunchedAsLogInItem;
     [NSUserDefaults.standardUserDefaults registerDefaults:@{
         TDEnabledDefaultsKey: @YES,
         TDAutomaticLoggingDefaultsKey: @YES,
@@ -426,7 +433,7 @@
         TDGestureEngineInstallEventTaps()) {
         TDGestureEngineSetEnabled(YES);
     }
-    [self setupStatusItem];
+    if (!launchedAtLogin) [self setupStatusItem];
     [self startMultitouch];
 
     NSNotificationCenter *notifications =

@@ -31,6 +31,8 @@ TapDrag uses Apple's private `MultitouchSupport.framework` to observe raw trackp
 
 Check `Launch at Login` in the menu to start TapDrag automatically when you log in to macOS; uncheck it to disable automatic startup. The menu reflects the current system setting each time it opens. A dash means macOS approval is pending; use `Approve Launch at Login...` to open Login Items settings. This setting is independent of `Enabled`.
 
+When started at login, TapDrag runs in the background without a menu bar icon. Open TapDrag from Finder or Spotlight to show the icon, including when it is already running. Manually launching the app always shows the icon. Choose `Hide Menu Bar Icon` to hide it again without stopping the gesture engine.
+
 TapDrag applies the same first-tap decision window to every uniquely matched raw trackpad tap. This adds roughly 180 ms to ordinary tap-to-click actions. Confirming a drag cancels the buffered first click; otherwise its complete down/up pair is replayed. Physical trackpad presses, mouse clicks, and clicks that cannot be uniquely correlated with a raw tap remain immediate.
 
 The first contact must be a short, stationary tap. The second contact must begin 30–160 ms after the first raw lift. Movement beyond 1.3 mm confirms the drag immediately; a stationary 180 ms hold can also confirm deliberate drag intent. Multi-finger contact invalidates the candidate.
