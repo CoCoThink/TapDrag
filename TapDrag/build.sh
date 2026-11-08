@@ -59,6 +59,7 @@ clang \
 cp -X "$ROOT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 plutil -insert TapDragBuildConfiguration -string "$BUILD_CONFIGURATION" "$CONTENTS_DIR/Info.plist"
 cp -X "$ROOT_DIR/Resources/AppIcon.png" "$RESOURCES_DIR/AppIcon.png"
+cp -X "$ROOT_DIR/../LICENSE" "$RESOURCES_DIR/LICENSE"
 printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
 
 xattr -cr "$APP_DIR"

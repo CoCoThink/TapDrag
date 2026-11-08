@@ -71,6 +71,8 @@ Implementation details and invariants are documented in [the maintainer referenc
 
 For Apple-issued signing, set `TAPDRAG_CODESIGN_IDENTITY`. For release packaging, set `TAPDRAG_RELEASE_CODESIGN_IDENTITY`.
 
+Commit tracked changes before running `make release`. Release packages include the license text inside the app, a corresponding source archive from the current commit, and SHA-256 checksums for both downloads.
+
 ## Diagnostics
 
 While TapDrag is enabled, automatic JSONL traces are stored in:
@@ -101,4 +103,4 @@ docs/MANUAL_TESTING.md          Manual macOS UI, lifecycle, and hardware tests
 
 TapDrag began as an enhanced fork of [ddugel3/3FDragUnstuck](https://github.com/ddugel3/3FDragUnstuck). The current product and gesture path are focused exclusively on immediate-release double-tap dragging.
 
-Released under the MIT License. See `LICENSE`.
+Released under the GNU General Public License version 2 only (`GPL-2.0-only`). See `LICENSE`.
