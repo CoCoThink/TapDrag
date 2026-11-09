@@ -18,7 +18,7 @@ TapDrag uses Apple's private `MultitouchSupport.framework` to observe raw trackp
 
 - macOS 13 or later on Apple silicon.
 - Tap to click enabled.
-- The system trackpad **Dragging** option disabled. TapDrag stays inactive while native dragging is enabled, preventing two drag implementations from competing.
+- The system trackpad **Dragging** option **disabled** (`System Settings` → `Accessibility` → `Pointer Control` → `Trackpad Options` → turn off `Use trackpad for dragging`). TapDrag stays inactive while native dragging is enabled, preventing two drag implementations from competing.
 - Accessibility permission and, when macOS requests it separately, Input Monitoring permission.
 
 ## Use
