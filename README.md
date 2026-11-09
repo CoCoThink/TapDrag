@@ -12,14 +12,14 @@ TapDrag is a lightweight macOS menu bar utility that provides double-tap draggin
 - Keeps a bounded automatic diagnostic trace for difficult gesture failures.
 - Handles drag input at the HID stage and observes downstream events for diagnostics.
 
+TapDrag uses Apple's private `MultitouchSupport.framework` to observe raw trackpad contacts.
+
 ## Requirements
 
 - macOS 13 or later on Apple silicon.
 - Tap to click enabled.
 - The system trackpad **Dragging** option disabled. TapDrag stays inactive while native dragging is enabled, preventing two drag implementations from competing.
 - Accessibility permission and, when macOS requests it separately, Input Monitoring permission.
-
-TapDrag uses Apple's private `MultitouchSupport.framework` to observe raw trackpad contacts. This is suitable for a personal utility but not Mac App Store distribution.
 
 ## Use
 
